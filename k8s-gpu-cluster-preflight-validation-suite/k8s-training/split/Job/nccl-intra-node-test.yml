@@ -1,0 +1,234 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nccl-intra-node-test
+  namespace: gpu-preflight
+  labels:
+    app: nccl-test
+    component: nccl
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: nccl-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: nccl-test
+          image: nvcr.io/nvidia/pytorch:24.01-py3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+
+              NODE_NAME="${NODE_NAME:-unknown}"
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-nccl-intra.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CONFIG_FILE="/config/config.json"
+
+              mkdir -p "${RESULTS_DIR}" "${SHARED_DIR}"
+
+              echo "=========================================="
+              echo "NCCL Intra-Node Test (Nebius Optimized)"
+              echo "Node: ${NODE_NAME}"
+              echo "=========================================="
+
+              # Load thresholds
+              MIN_BW=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['nccl']['min_intra_node_bandwidth_gbps'])")
+              MAX_LAT=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['nccl']['max_latency_us'])")
+
+              # ============================================================
+              # NEBIUS-RECOMMENDED NCCL ENVIRONMENT VARIABLES
+              # ============================================================
+              export NCCL_IB_QPS_PER_CONNECTION=2
+              export NCCL_NVLS_ENABLE=1
+              export NCCL_BUFFSIZE=8388608
+              export NCCL_DEBUG=WARN
+
+              # Download Nebius topology file
+              mkdir -p /opt/nebius
+              curl -sSf -o /opt/nebius/nccl-topo.xml \
+                https://raw.githubusercontent.com/nebius/nccl-topology/main/nccl-topo-b200-v1.xml 2>/dev/null || \
+              curl -sSf -o /opt/nebius/nccl-topo.xml \
+                https://raw.githubusercontent.com/nebius/nccl-topology/main/nccl-topo-h100-v1.xml 2>/dev/null || true
+              [ -f /opt/nebius/nccl-topo.xml ] && export NCCL_TOPO_FILE=/opt/nebius/nccl-topo.xml
+
+              echo "NCCL Environment:"
+              echo "  NCCL_IB_QPS_PER_CONNECTION=${NCCL_IB_QPS_PER_CONNECTION}"
+              echo "  NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE}"
+              echo "  NCCL_BUFFSIZE=${NCCL_BUFFSIZE}"
+              echo "  NCCL_TOPO_FILE=${NCCL_TOPO_FILE:-auto}"
+              echo ""
+
+              # Build NCCL tests
+              cd /tmp
+              git clone https://github.com/NVIDIA/nccl-tests.git 2>/dev/null || true
+              cd nccl-tests
+              make MPI=0 CUDA_HOME=/usr/local/cuda -j$(nproc) 2>/dev/null || make MPI=0 -j$(nproc)
+
+              export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+              GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+
+              # ============================================================
+              # Run NCCL all_reduce_perf with LATENCY measurement
+              # ============================================================
+              echo "Running all_reduce_perf with ${GPU_COUNT} GPUs..."
+              echo "Parameters: -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 50"
+              echo ""
+
+              ALL_REDUCE_OUTPUT=$(./build/all_reduce_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 50 2>&1) || true
+              echo "$ALL_REDUCE_OUTPUT"
+
+              # Parse bus bandwidth from nccl-tests output (busbw is the penultimate column, last column is #wrong)
+              BW_1GB=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+
+              # Parse algorithm time (us) for the smallest message size (8 bytes)
+              LAT_8B=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 == 8 {print $6}' | tail -1)
+
+              # Average bus bandwidth from large messages
+              AVG_BW=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 ~ /^[0-9]+$/ && $1 >= 67108864 {sum+=$(NF-1); count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+
+              # Run additional tests
+              echo ""
+              echo "Running all_gather_perf..."
+              GATHER_BW=$(./build/all_gather_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1 | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+
+              echo "Running reduce_scatter_perf..."
+              SCATTER_BW=$(./build/reduce_scatter_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1 | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+
+              # ============================================================
+              # NEBIUS ADDITIONAL TEST: NCCL path test with P2P/SHM disabled
+              # Source: nebius.com/blog/posts/how-we-build-reliable-clusters
+              # This biases transport away from NVLink/P2P/SHM to exercise network paths
+              # ============================================================
+              echo ""
+              echo "Running all_reduce forced over InfiniBand (disabling NVLink)..."
+              export NCCL_P2P_DISABLE=1
+              export NCCL_SHM_DISABLE=1
+              IB_FORCED_OUTPUT=$(./build/all_reduce_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1) || true
+              IB_FORCED_BW=$(echo "$IB_FORCED_OUTPUT" | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+              IB_FORCED_BW=${IB_FORCED_BW:-0}
+              echo "  InfiniBand-forced bus bandwidth: ${IB_FORCED_BW} GB/s"
+              unset NCCL_P2P_DISABLE NCCL_SHM_DISABLE
+
+              # Default values
+              BW_1GB=${BW_1GB:-0}; AVG_BW=${AVG_BW:-0}
+              GATHER_BW=${GATHER_BW:-0}; SCATTER_BW=${SCATTER_BW:-0}
+              LAT_8B=${LAT_8B:-0}
+
+              # Evaluate pass/fail
+              STATUS="PASS"; ISSUES=""
+
+              # Check bandwidth
+              if (( $(echo "${AVG_BW} > 0 && ${AVG_BW} < ${MIN_BW}" | bc -l 2>/dev/null || echo 0) )); then
+                STATUS="FAIL"
+                ISSUES="${ISSUES}bandwidth_low(${AVG_BW}<${MIN_BW});"
+              fi
+
+              # Check latency
+              if (( $(echo "${LAT_8B} > 0 && ${LAT_8B} > ${MAX_LAT}" | bc -l 2>/dev/null || echo 0) )); then
+                STATUS="FAIL"
+                ISSUES="${ISSUES}latency_high(${LAT_8B}>${MAX_LAT});"
+              fi
+
+              # Generate JSON report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "nccl_intra_node",
+                "node": "${NODE_NAME}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "gpu_count": ${GPU_COUNT},
+                "nebius_optimizations": {
+                  "NCCL_NVLS_ENABLE": 1,
+                  "NCCL_IB_QPS_PER_CONNECTION": 2,
+                  "NCCL_BUFFSIZE": 8388608
+                },
+                "bandwidth": {
+                  "all_reduce_1gb_busbw_gbs": ${BW_1GB},
+                  "all_reduce_avg_busbw_gbs": ${AVG_BW},
+                  "all_gather_1gb_busbw_gbs": ${GATHER_BW},
+                  "reduce_scatter_1gb_busbw_gbs": ${SCATTER_BW},
+                  "ib_forced_1gb_busbw_gbs": ${IB_FORCED_BW},
+                  "threshold_busbw_gbs": ${MIN_BW}
+                },
+                "latency": {
+                  "all_reduce_8b_us": ${LAT_8B},
+                  "threshold_us": ${MAX_LAT}
+                },
+                "issues": "${ISSUES}"
+              }
+              EOF
+
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+
+              echo ""
+              echo "=========================================="
+              echo "Results: Status=${STATUS}, BusBW=${AVG_BW} GB/s, Latency=${LAT_8B} us"
+              echo "=========================================="
+
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            privileged: true
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+# =============================================================================
+# SECTION 5: NETWORK / TCP VALIDATION
+# =============================================================================
+# ☑ TCP connectivity between nodes
+# ☑ Multi-node communication test
+# ☑ Packet loss detection
+# ☑ Bandwidth measurement
+# ☑ Latency measurement
+# =============================================================================

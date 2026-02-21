@@ -1,0 +1,252 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: storage-benchmark
+  namespace: gpu-preflight
+  labels:
+    app: storage-test
+    component: storage
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: storage-test
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: storage-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+
+              apt-get update && apt-get install -y fio jq bc > /dev/null 2>&1
+
+              NODE_NAME="${NODE_NAME:-unknown}"
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-storage.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CONFIG_FILE="/config/config.json"
+
+              # Test on SHARED storage
+              TEST_DIR="/shared-results/storage-test-${NODE_NAME}-$$"
+              mkdir -p "${RESULTS_DIR}" "${TEST_DIR}"
+              cd "${TEST_DIR}"
+
+              echo "=========================================="
+              echo "Storage Benchmark (Shared Storage + Local)"
+              echo "Node: ${NODE_NAME}"
+              echo "Test Directory: ${TEST_DIR}"
+              echo "=========================================="
+
+              # Load thresholds
+              MIN_SEQ_READ=$(jq -r '.storage.min_sequential_read_mbps' "${CONFIG_FILE}")
+              MIN_SEQ_WRITE=$(jq -r '.storage.min_sequential_write_mbps' "${CONFIG_FILE}")
+              MIN_RAND_IOPS=$(jq -r '.storage.min_random_read_iops' "${CONFIG_FILE}")
+              MAX_LAT=$(jq -r '.storage.max_latency_ms' "${CONFIG_FILE}")
+
+              echo "Thresholds: SeqRead=${MIN_SEQ_READ}MB/s, SeqWrite=${MIN_SEQ_WRITE}MB/s, RandIOPS=${MIN_RAND_IOPS}, MaxLat=${MAX_LAT}ms"
+              echo ""
+
+              # =============================================================
+              # PART 1: LOCAL/TEMPORARY STORAGE (node-local SSD/NVMe)
+              # =============================================================
+              echo ">>> PART 1: Local/Temporary Storage (/tmp) <<<"
+              LOCAL_TEST_DIR="/tmp/preflight-storage-$$"
+              mkdir -p "${LOCAL_TEST_DIR}"
+              cd "${LOCAL_TEST_DIR}"
+
+              echo "Local Test 1: Sequential Read (1MB blocks)..."
+              fio --name=local_seq_read --rw=read --bs=1M --size=1G --numjobs=4 \
+                  --time_based --runtime=15 --group_reporting \
+                  --output-format=json --output=/tmp/local_seq_read.json 2>/dev/null
+
+              LOCAL_SEQ_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/local_seq_read.json | awk '{printf "%.2f", $1/1048576}')
+              LOCAL_SEQ_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/local_seq_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  Bandwidth: ${LOCAL_SEQ_READ_BW} MB/s, Latency: ${LOCAL_SEQ_READ_LAT} ms"
+
+              echo "Local Test 2: Random Read (4K blocks)..."
+              fio --name=local_rand_read --rw=randread --bs=4K --size=256M --numjobs=4 \
+                  --time_based --runtime=15 --group_reporting \
+                  --output-format=json --output=/tmp/local_rand_read.json 2>/dev/null
+
+              LOCAL_RAND_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/local_rand_read.json | awk '{printf "%.0f", $1}')
+              LOCAL_RAND_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/local_rand_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${LOCAL_RAND_IOPS}, Latency: ${LOCAL_RAND_LAT} ms"
+
+              rm -rf "${LOCAL_TEST_DIR}"
+              echo ""
+
+              # =============================================================
+              # PART 2: SHARED STORAGE (NFS / Parallel FS)
+              # =============================================================
+              echo ">>> PART 2: Shared Storage (${TEST_DIR}) <<<"
+              cd "${TEST_DIR}"
+
+              # Test 1: Large Sequential Read (checkpoint loading simulation)
+              # NOTE: Nebius docs recommend 4MiB blocks for maximum bandwidth
+              echo "Test 1: Sequential Read (4MB blocks per Nebius recommendation)..."
+              fio --name=seq_read --rw=read --bs=4M --size=2G --numjobs=4 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/seq_read.json 2>/dev/null
+
+              SEQ_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/seq_read.json | awk '{printf "%.2f", $1/1048576}')
+              SEQ_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/seq_read.json | awk '{printf "%.2f", $1/1000000}')
+              SEQ_READ_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/seq_read.json)
+              echo "  Bandwidth: ${SEQ_READ_BW} MB/s, Latency: ${SEQ_READ_LAT} ms, IOPS: ${SEQ_READ_IOPS}"
+
+              # Test 2: Sequential Write (checkpoint saving)
+              echo "Test 2: Sequential Write (4MB blocks)..."
+              fio --name=seq_write --rw=write --bs=4M --size=2G --numjobs=4 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/seq_write.json 2>/dev/null
+
+              SEQ_WRITE_BW=$(jq -r '.jobs[0].write.bw_bytes // 0' /tmp/seq_write.json | awk '{printf "%.2f", $1/1048576}')
+              SEQ_WRITE_LAT=$(jq -r '.jobs[0].write.lat_ns.mean // 0' /tmp/seq_write.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  Bandwidth: ${SEQ_WRITE_BW} MB/s, Latency: ${SEQ_WRITE_LAT} ms"
+
+              # Test 3: Many Small Random Reads (training sample access)
+              echo "Test 3: Random Read (4K blocks)..."
+              fio --name=rand_read --rw=randread --bs=4K --size=512M --numjobs=8 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/rand_read.json 2>/dev/null
+
+              RAND_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/rand_read.json | awk '{printf "%.2f", $1/1048576}')
+              RAND_READ_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/rand_read.json | awk '{printf "%.0f", $1}')
+              RAND_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/rand_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${RAND_READ_IOPS}, Bandwidth: ${RAND_READ_BW} MB/s, Latency: ${RAND_READ_LAT} ms"
+
+              # Test 4: Random Write
+              echo "Test 4: Random Write (4K blocks)..."
+              fio --name=rand_write --rw=randwrite --bs=4K --size=512M --numjobs=8 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/rand_write.json 2>/dev/null
+
+              RAND_WRITE_IOPS=$(jq -r '.jobs[0].write.iops // 0' /tmp/rand_write.json | awk '{printf "%.0f", $1}')
+              RAND_WRITE_LAT=$(jq -r '.jobs[0].write.lat_ns.mean // 0' /tmp/rand_write.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${RAND_WRITE_IOPS}, Latency: ${RAND_WRITE_LAT} ms"
+
+              # Cleanup
+              cd /tmp
+              rm -rf "${TEST_DIR}"
+
+              # Evaluate
+              STATUS="PASS"; ISSUES=""
+
+              if (( $(echo "${SEQ_READ_BW} < ${MIN_SEQ_READ}" | bc -l) )); then
+                STATUS="FAIL"; ISSUES="${ISSUES}seq_read_low(${SEQ_READ_BW}<${MIN_SEQ_READ});"
+              fi
+              if (( $(echo "${SEQ_WRITE_BW} < ${MIN_SEQ_WRITE}" | bc -l) )); then
+                STATUS="FAIL"; ISSUES="${ISSUES}seq_write_low(${SEQ_WRITE_BW}<${MIN_SEQ_WRITE});"
+              fi
+              if (( $(echo "${RAND_READ_IOPS} < ${MIN_RAND_IOPS}" | bc -l) )); then
+                STATUS="WARN"; ISSUES="${ISSUES}rand_iops_low(${RAND_READ_IOPS}<${MIN_RAND_IOPS});"
+              fi
+              if (( $(echo "${SEQ_READ_LAT} > ${MAX_LAT}" | bc -l) )); then
+                STATUS="WARN"; ISSUES="${ISSUES}high_latency(${SEQ_READ_LAT}>${MAX_LAT});"
+              fi
+
+              # Generate JSON report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "storage_shared_and_local",
+                "node": "${NODE_NAME}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "thresholds": {
+                  "min_seq_read_mbps": ${MIN_SEQ_READ},
+                  "min_seq_write_mbps": ${MIN_SEQ_WRITE},
+                  "min_rand_iops": ${MIN_RAND_IOPS},
+                  "max_latency_ms": ${MAX_LAT}
+                },
+                "local_storage": {
+                  "sequential_read": {
+                    "bandwidth_mbps": ${LOCAL_SEQ_READ_BW},
+                    "latency_ms": ${LOCAL_SEQ_READ_LAT}
+                  },
+                  "random_read": {
+                    "iops": ${LOCAL_RAND_IOPS},
+                    "latency_ms": ${LOCAL_RAND_LAT}
+                  }
+                },
+                "shared_storage": {
+                  "sequential_read": {
+                    "bandwidth_mbps": ${SEQ_READ_BW},
+                    "latency_ms": ${SEQ_READ_LAT},
+                    "iops": ${SEQ_READ_IOPS}
+                  },
+                  "sequential_write": {
+                    "bandwidth_mbps": ${SEQ_WRITE_BW},
+                    "latency_ms": ${SEQ_WRITE_LAT}
+                  },
+                  "random_read": {
+                    "iops": ${RAND_READ_IOPS},
+                    "bandwidth_mbps": ${RAND_READ_BW},
+                    "latency_ms": ${RAND_READ_LAT}
+                  },
+                  "random_write": {
+                    "iops": ${RAND_WRITE_IOPS},
+                    "latency_ms": ${RAND_WRITE_LAT}
+                  }
+                },
+                "issues": "${ISSUES}"
+              }
+              EOF
+
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+
+              echo ""
+              echo "Storage test complete. Status: ${STATUS}"
+
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+# =============================================================================
+# SECTION 7: SCHEDULER VALIDATION
+# =============================================================================
+# ☑ GPU pods scheduled only on GPU nodes
+# ☑ Tainted nodes avoided
+# ☑ Multi-node distributed job scheduling verified
+# =============================================================================

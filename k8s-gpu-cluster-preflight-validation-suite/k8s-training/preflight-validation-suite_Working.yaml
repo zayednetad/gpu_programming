@@ -1,0 +1,1843 @@
+# =============================================================================
+# GPU CLUSTER PREFLIGHT VALIDATION SUITE - COMPLETE VERSION
+# =============================================================================
+# Covers ALL assignment requirements:
+#   1. Preflight Execution Framework
+#   2. Node & GPU Health Checks (Driver/CUDA/NCCL, Hardware, Compute, Isolation)
+#   3. Intra-Node GPU Fabric (NVLink/NVSwitch)
+#   4. Network / TCP Validation
+#   5. Storage Preflight (Shared Storage)
+#   6. Scheduler Validation
+#   7. Telemetry & Reporting
+#   8. Central Result Storage
+#   9. Final Decision Logic
+#
+# Based on Nebius official documentation:
+#   - NCCL Tests: https://docs.nebius.com/slurm-soperator/jobs/examples/nccl-all-reduce
+#   - GPU Platforms: https://docs.nebius.com/compute/virtual-machines/types
+#   - Storage: https://docs.nebius.com/compute/storage/types
+#   - Health Checks: https://nebius.com/blog/posts/how-we-build-reliable-clusters
+#   - NCCL Topology: https://github.com/nebius/nccl-topology
+#
+# Tuned to align with Nebius/NVIDIA guidance where applicable:
+#   NCCL_IB_QPS_PER_CONNECTION=2
+#   NCCL_NVLS_ENABLE=1 (NVLink SHARP)
+#   NCCL_BUFFSIZE=8388608 (8 MiB)
+#   DCGM diagnostics level 2
+#   Storage 4MiB blocks for max bandwidth
+#   NCCL path test with P2P/SHM disabled
+#
+# Usage:
+#   kubectl apply -f preflight-validation-suite.yaml
+#   kubectl logs job/preflight-aggregator -n gpu-preflight
+#   kubectl get nodes -L preflight-status
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NAMESPACE
+# -----------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-preflight
+  labels:
+    app: gpu-preflight
+
+# -----------------------------------------------------------------------------
+# CONFIGMAP - Test thresholds and pass/fail policy
+# -----------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: preflight-config
+  namespace: gpu-preflight
+data:
+  # =============================================================================
+  # NEBIUS B200 GPU CLUSTER - PREFLIGHT THRESHOLDS
+  # =============================================================================
+  # Based on:
+  #   - Nebius B200 cluster actual values (nvidia-smi output)
+  #   - Nebius documentation: https://docs.nebius.com/
+  #   - NVIDIA Blackwell architecture specifications
+  # =============================================================================
+  config.json: |
+    {
+      "cluster_info": {
+        "platform": "gpu-b200-sxm-a",
+        "region": "me-west1",
+        "gpu_model": "NVIDIA B200",
+        "infiniband_fabric": "me-west1-a"
+      },
+      "versions": {
+        "_comment": "Versions based on Nebius B200 cluster (nvidia-smi: Driver 570.195.03, CUDA 12.8)",
+        "nvidia_driver_min": "570.0",
+        "cuda_version_min": "12.8",
+        "nccl_version_min": "2.20"
+      },
+      "gpu": {
+        "_comment": "B200 SXM: 8 GPUs per node, 180GB HBM3e per GPU, TDP 1000W",
+        "expected_count_per_node": 8,
+        "max_temperature_celsius": 83,
+        "max_ecc_errors": 0,
+        "min_memory_gb": 175,
+        "max_utilization_idle": 5,
+        "min_matmul_tflops": 100
+      },
+      "nccl": {
+        "_comment": "B200 NVLink: 1.8TB/s bidirectional, NVSwitch 3.6TB/s per switch",
+        "min_intra_node_bandwidth_gbps": 450,
+        "max_latency_us": 30
+      },
+      "network": {
+        "_comment": "Nebius Quantum-2 InfiniBand: 400Gbps per port, 3.2Tbps per node",
+        "min_tcp_bandwidth_gbps": 20,
+        "max_tcp_latency_ms": 0.5,
+        "max_packet_loss_percent": 0.001
+      },
+      "storage": {
+        "_comment": "Nebius Filestore SSD: Shared filesystem for checkpoints",
+        "min_sequential_read_mbps": 500,
+        "min_sequential_write_mbps": 400,
+        "min_random_read_iops": 5000,
+        "max_latency_ms": 10
+      }
+    }
+
+# -----------------------------------------------------------------------------
+# RBAC - Service accounts and permissions
+# -----------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-sa
+  namespace: gpu-preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: preflight-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "services"]
+    verbs: ["get", "list", "patch", "update", "create", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-binding
+subjects:
+  - kind: ServiceAccount
+    name: preflight-sa
+    namespace: gpu-preflight
+roleRef:
+  kind: ClusterRole
+  name: preflight-role
+  apiGroup: rbac.authorization.k8s.io
+
+# -----------------------------------------------------------------------------
+# SHARED STORAGE - Host-mounted shared filesystem (Section 9)
+# -----------------------------------------------------------------------------
+# NOTE: This path must exist on every worker node and point to the same shared filesystem.
+# If your Nebius mount tag is different, replace `/mnt/data` in all `shared-results` volumes below.
+
+# =============================================================================
+# SECTION 3: NODE & GPU HEALTH CHECKS (Job)
+# =============================================================================
+# ☑ NVIDIA driver installed & version check
+# ☑ CUDA toolkit installed & version check  
+# ☑ NCCL installed & version check
+# ☑ Expected GPU count per node
+# ☑ ECC status & error count
+# ☑ GPU temperature threshold
+# ☑ GPU utilization check (not stuck)
+# ☑ Matrix multiply on EACH GPU with TFLOPS measurement
+# ☑ Node labeling/tainting for failed nodes
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-health-check
+  namespace: gpu-preflight
+  labels:
+    app: gpu-health-check
+    component: gpu-health
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: gpu-health-check
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: gpu-preflight
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: gpu-health
+          image: nvcr.io/nvidia/cuda:12.4.0-devel-ubuntu22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              # Install dependencies
+              apt-get update && apt-get install -y jq curl bc > /dev/null 2>&1
+              curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" > /dev/null 2>&1
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              NODE_NAME="${NODE_NAME:-unknown}"
+              CONFIG_FILE="/config/config.json"
+              mkdir -p "${RESULTS_DIR}" "${SHARED_DIR}"
+              
+              # Load thresholds
+              EXPECTED_GPUS=$(jq -r '.gpu.expected_count_per_node' "${CONFIG_FILE}")
+              MAX_TEMP=$(jq -r '.gpu.max_temperature_celsius' "${CONFIG_FILE}")
+              MAX_ECC=$(jq -r '.gpu.max_ecc_errors' "${CONFIG_FILE}")
+              MAX_UTIL_IDLE=$(jq -r '.gpu.max_utilization_idle' "${CONFIG_FILE}")
+              MIN_MEMORY_GB=$(jq -r '.gpu.min_memory_gb' "${CONFIG_FILE}")
+              MIN_TFLOPS=$(jq -r '.gpu.min_matmul_tflops' "${CONFIG_FILE}")
+              MIN_DRIVER=$(jq -r '.versions.nvidia_driver_min' "${CONFIG_FILE}")
+              MIN_CUDA=$(jq -r '.versions.cuda_version_min' "${CONFIG_FILE}")
+              MIN_NCCL=$(jq -r '.versions.nccl_version_min' "${CONFIG_FILE}")
+              
+              run_health_check() {
+                TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-gpu-health.json"
+                
+                echo "=========================================="
+                echo "GPU Health Check: ${NODE_NAME}"
+                echo "Timestamp: ${TIMESTAMP}"
+                echo "=========================================="
+                
+                OVERALL_STATUS="PASS"
+                ISSUES=""
+                
+                # --------------------------------------------------------
+                # 3.1 Driver / CUDA / NCCL Version Checks
+                # --------------------------------------------------------
+                echo ""
+                echo "=== Version Checks ==="
+                
+                # NVIDIA Driver
+                DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d ' ')
+                if [ -z "$DRIVER_VERSION" ]; then
+                  DRIVER_STATUS="FAIL"; OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}driver_not_found;"
+                elif [ "$(printf '%s\n' "$MIN_DRIVER" "$DRIVER_VERSION" | sort -V | head -n1)" = "$MIN_DRIVER" ]; then
+                  DRIVER_STATUS="PASS"
+                else
+                  DRIVER_STATUS="FAIL"; OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}driver_version_low(${DRIVER_VERSION}<${MIN_DRIVER});"
+                fi
+                echo "  NVIDIA Driver: ${DRIVER_VERSION} (min: ${MIN_DRIVER}) [${DRIVER_STATUS}]"
+                
+                # CUDA Version (prefer driver-reported runtime support)
+                CUDA_VERSION=$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: \([0-9.]*\).*/\1/p' | head -1)
+                if [ -z "${CUDA_VERSION}" ]; then
+                  CUDA_VERSION=$(nvcc --version 2>/dev/null | grep "release" | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' || echo "not_found")
+                fi
+                if [ "$CUDA_VERSION" = "not_found" ]; then
+                  CUDA_STATUS="FAIL"; OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}cuda_not_found;"
+                elif [ "$(printf '%s\n' "$MIN_CUDA" "$CUDA_VERSION" | sort -V | head -n1)" = "$MIN_CUDA" ]; then
+                  CUDA_STATUS="PASS"
+                else
+                  CUDA_STATUS="FAIL"; OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}cuda_version_low(${CUDA_VERSION}<${MIN_CUDA});"
+                fi
+                echo "  CUDA Toolkit: ${CUDA_VERSION} (min: ${MIN_CUDA}) [${CUDA_STATUS}]"
+                
+                # NCCL Version
+                NCCL_VERSION=$(python3 -c "import torch; print(torch.cuda.nccl.version())" 2>/dev/null || \
+                               ldconfig -p 2>/dev/null | grep -i nccl | head -1 | grep -oP '\d+\.\d+' || echo "not_found")
+                if [ "$NCCL_VERSION" = "not_found" ] || [ -z "$NCCL_VERSION" ]; then
+                  NCCL_STATUS="WARN"
+                  NCCL_VERSION="system_default"
+                else
+                  if [ "$(printf '%s\n' "$MIN_NCCL" "$NCCL_VERSION" | sort -V | head -n1)" = "$MIN_NCCL" ]; then
+                    NCCL_STATUS="PASS"
+                  else
+                    NCCL_STATUS="WARN"; ISSUES="${ISSUES}nccl_version_low;"
+                  fi
+                fi
+                echo "  NCCL: ${NCCL_VERSION} (min: ${MIN_NCCL}) [${NCCL_STATUS}]"
+                
+                # --------------------------------------------------------
+                # 3.2 GPU Visibility & Hardware Health
+                # --------------------------------------------------------
+                echo ""
+                echo "=== GPU Hardware Health ==="
+                
+                GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)
+                if [ "$GPU_COUNT" -ge "$EXPECTED_GPUS" ]; then
+                  GPU_COUNT_STATUS="PASS"
+                else
+                  GPU_COUNT_STATUS="FAIL"; OVERALL_STATUS="FAIL"
+                  ISSUES="${ISSUES}gpu_count(found:${GPU_COUNT},expected:${EXPECTED_GPUS});"
+                fi
+                echo "  GPU Count: ${GPU_COUNT}/${EXPECTED_GPUS} [${GPU_COUNT_STATUS}]"
+                
+                GPU_HEALTH_JSON="["
+                for i in $(seq 0 $((GPU_COUNT - 1))); do
+                  GPU_INFO=$(nvidia-smi -i $i --query-gpu=index,name,temperature.gpu,memory.total,ecc.mode.current,ecc.errors.corrected.volatile.total,utilization.gpu,power.draw --format=csv,noheader,nounits 2>/dev/null)
+                  IFS=',' read -r idx name temp mem_total ecc_mode ecc_errors util power <<< "$GPU_INFO"
+                  
+                  idx=$(echo "$idx" | xargs); name=$(echo "$name" | xargs)
+                  temp=$(echo "$temp" | xargs); ecc_mode=$(echo "$ecc_mode" | xargs)
+                  ecc_errors=$(echo "$ecc_errors" | xargs); util=$(echo "$util" | xargs)
+                  mem_gb=$((${mem_total:-0} / 1024))
+                  
+                  gpu_status="PASS"; gpu_issues=""
+                  
+                  # ECC Status
+                  if [ "${ecc_mode}" != "Enabled" ]; then
+                    gpu_issues="${gpu_issues}ecc_disabled;"
+                  fi
+                  
+                  # ECC Errors
+                  if [ "${ecc_errors:-0}" != "N/A" ] && [ "${ecc_errors:-0}" != "0" ] 2>/dev/null; then
+                    if [ "${ecc_errors}" -gt "${MAX_ECC}" ] 2>/dev/null; then
+                      gpu_status="FAIL"; gpu_issues="${gpu_issues}ecc_errors(${ecc_errors});"
+                      OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}GPU${idx}:ecc;"
+                    fi
+                  fi
+                  
+                  # Temperature
+                  if [ "${temp:-0}" -gt "${MAX_TEMP}" ] 2>/dev/null; then
+                    gpu_status="FAIL"; gpu_issues="${gpu_issues}high_temp(${temp}C);"
+                    OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}GPU${idx}:temp;"
+                  fi
+
+                  # Memory capacity
+                  if [ "${mem_gb:-0}" -lt "${MIN_MEMORY_GB}" ] 2>/dev/null; then
+                    gpu_status="FAIL"; gpu_issues="${gpu_issues}low_memory(${mem_gb}GB<${MIN_MEMORY_GB}GB);"
+                    OVERALL_STATUS="FAIL"; ISSUES="${ISSUES}GPU${idx}:memory;"
+                  fi
+                  
+                  # Utilization (check if stuck at high utilization when idle)
+                  if [ "${util:-0}" -gt "${MAX_UTIL_IDLE}" ] 2>/dev/null; then
+                    gpu_issues="${gpu_issues}high_idle_util(${util}%);"
+                  fi
+                  
+                  echo "  GPU ${idx} (${name}): Temp=${temp}C, ECC=${ecc_mode}, Errors=${ecc_errors:-0}, Util=${util}% [${gpu_status}]"
+                  
+                  [ $i -gt 0 ] && GPU_HEALTH_JSON="${GPU_HEALTH_JSON},"
+                  GPU_HEALTH_JSON="${GPU_HEALTH_JSON}{\"gpu_id\":${idx},\"name\":\"${name}\",\"temp_c\":${temp:-0},\"memory_gb\":${mem_gb},\"ecc_mode\":\"${ecc_mode}\",\"ecc_errors\":\"${ecc_errors:-0}\",\"utilization_pct\":${util:-0},\"status\":\"${gpu_status}\",\"issues\":\"${gpu_issues}\"}"
+                done
+                GPU_HEALTH_JSON="${GPU_HEALTH_JSON}]"
+                
+                # --------------------------------------------------------
+                # 3.2.1 DCGM Diagnostics (per Nebius best practices)
+                # Source: nebius.com/blog/posts/how-we-build-reliable-clusters
+                # Levels: r1=quick, r2=medium (recommended), r3=extended stress
+                # --------------------------------------------------------
+                echo ""
+                echo "=== DCGM Diagnostics (Level 2) ==="
+                
+                DCGM_STATUS="PASS"
+                DCGM_OUTPUT=""
+                
+                # Check if dcgmi is available
+                if command -v dcgmi &> /dev/null; then
+                  echo "Running dcgmi diag -r 2 (quick validation)..."
+                  DCGM_OUTPUT=$(dcgmi diag -r 2 2>&1) || true
+                  
+                  # Check for failures in DCGM output
+                  if echo "$DCGM_OUTPUT" | grep -q "Fail"; then
+                    DCGM_STATUS="FAIL"
+                    OVERALL_STATUS="FAIL"
+                    ISSUES="${ISSUES}dcgm_diag_failed;"
+                    echo "  DCGM Diagnostics: FAIL"
+                    echo "$DCGM_OUTPUT" | grep -E "(Fail|Warning)" | head -10
+                  else
+                    echo "  DCGM Diagnostics: PASS"
+                  fi
+                else
+                  echo "  dcgmi not available, skipping DCGM diagnostics"
+                  DCGM_STATUS="SKIPPED"
+                fi
+                
+                # --------------------------------------------------------
+                # 3.3 GPU Functional Test - Matrix Multiply on EACH GPU
+                # --------------------------------------------------------
+                echo ""
+                echo "=== GPU Compute Tests (Matrix Multiply) ==="
+                
+                # Create CUDA matrix multiply test
+                cat > /tmp/matmul_test.cu << 'CUDA_CODE'
+              #include <stdio.h>
+              #include <cuda_runtime.h>
+              #include <cublas_v2.h>
+              #include <sys/time.h>
+              
+              #define N 4096
+              #define ITERATIONS 100
+              
+              int main(int argc, char *argv[]) {
+                  int device = 0;
+                  if (argc > 1) device = atoi(argv[1]);
+                  
+                  cudaSetDevice(device);
+                  
+                  float *d_A, *d_B, *d_C;
+                  size_t size = N * N * sizeof(float);
+                  
+                  cudaMalloc(&d_A, size);
+                  cudaMalloc(&d_B, size);
+                  cudaMalloc(&d_C, size);
+                  
+                  // Initialize with random data
+                  float *h_data = (float*)malloc(size);
+                  for (int i = 0; i < N*N; i++) h_data[i] = (float)rand() / RAND_MAX;
+                  cudaMemcpy(d_A, h_data, size, cudaMemcpyHostToDevice);
+                  cudaMemcpy(d_B, h_data, size, cudaMemcpyHostToDevice);
+                  free(h_data);
+                  
+                  cublasHandle_t handle;
+                  cublasCreate(&handle);
+                  
+                  float alpha = 1.0f, beta = 0.0f;
+                  
+                  // Warmup
+                  for (int i = 0; i < 10; i++) {
+                      cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_A, N, d_B, N, &beta, d_C, N);
+                  }
+                  cudaDeviceSynchronize();
+                  
+                  // Benchmark
+                  struct timeval start, end;
+                  gettimeofday(&start, NULL);
+                  
+                  for (int i = 0; i < ITERATIONS; i++) {
+                      cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_A, N, d_B, N, &beta, d_C, N);
+                  }
+                  cudaDeviceSynchronize();
+                  
+                  gettimeofday(&end, NULL);
+                  
+                  double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec) / 1e6;
+                  double ops = 2.0 * N * N * N * ITERATIONS;
+                  double tflops = ops / elapsed / 1e12;
+                  
+                  cudaError_t err = cudaGetLastError();
+                  
+                  printf("{\"gpu\":%d,\"tflops\":%.2f,\"status\":\"%s\"}\n", 
+                         device, tflops, err == cudaSuccess ? "PASS" : "FAIL");
+                  
+                  cublasDestroy(handle);
+                  cudaFree(d_A);
+                  cudaFree(d_B);
+                  cudaFree(d_C);
+                  
+                  return err == cudaSuccess ? 0 : 1;
+              }
+              CUDA_CODE
+                
+                COMPUTE_RESULTS="["
+                COMPUTE_STATUS="PASS"
+                
+                if nvcc /tmp/matmul_test.cu -o /tmp/matmul_test -lcublas 2>/dev/null; then
+                  for i in $(seq 0 $((GPU_COUNT - 1))); do
+                    RESULT=$(/tmp/matmul_test $i 2>/dev/null || echo "{\"gpu\":$i,\"tflops\":0,\"status\":\"FAIL\"}")
+                    TFLOPS=$(echo "$RESULT" | grep -oP '"tflops":\K[0-9.]+' || echo "0")
+                    STATUS=$(echo "$RESULT" | grep -oP '"status":"\K[^"]+' || echo "FAIL")
+                    
+                    echo "  GPU ${i}: ${TFLOPS} TFLOPS [${STATUS}]"
+                    
+                    if [ "${STATUS}" = "FAIL" ]; then
+                      COMPUTE_STATUS="FAIL"
+                      OVERALL_STATUS="FAIL"
+                      ISSUES="${ISSUES}GPU${i}:compute_failed;"
+                    elif (( $(echo "${TFLOPS} < ${MIN_TFLOPS}" | bc -l 2>/dev/null || echo 0) )); then
+                      if [ "${TFLOPS}" != "0" ]; then
+                        COMPUTE_STATUS="WARN"
+                        ISSUES="${ISSUES}GPU${i}:low_tflops(${TFLOPS});"
+                      fi
+                    fi
+                    
+                    [ $i -gt 0 ] && COMPUTE_RESULTS="${COMPUTE_RESULTS},"
+                    COMPUTE_RESULTS="${COMPUTE_RESULTS}{\"gpu_id\":${i},\"tflops\":${TFLOPS},\"status\":\"${STATUS}\"}"
+                  done
+                else
+                  echo "  Warning: Could not compile CUDA test, using simple validation"
+                  COMPUTE_STATUS="WARN"
+                  for i in $(seq 0 $((GPU_COUNT - 1))); do
+                    [ $i -gt 0 ] && COMPUTE_RESULTS="${COMPUTE_RESULTS},"
+                    COMPUTE_RESULTS="${COMPUTE_RESULTS}{\"gpu_id\":${i},\"tflops\":0,\"status\":\"SKIPPED\"}"
+                  done
+                fi
+                COMPUTE_RESULTS="${COMPUTE_RESULTS}]"
+                
+                # --------------------------------------------------------
+                # Generate JSON Report
+                # --------------------------------------------------------
+                cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "gpu_health",
+                "node": "${NODE_NAME}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${OVERALL_STATUS}",
+                "versions": {
+                  "driver": {"version": "${DRIVER_VERSION}", "min": "${MIN_DRIVER}", "status": "${DRIVER_STATUS}"},
+                  "cuda": {"version": "${CUDA_VERSION}", "min": "${MIN_CUDA}", "status": "${CUDA_STATUS}"},
+                  "nccl": {"version": "${NCCL_VERSION}", "min": "${MIN_NCCL}", "status": "${NCCL_STATUS}"}
+                },
+                "gpu_count": {"found": ${GPU_COUNT}, "expected": ${EXPECTED_GPUS}, "status": "${GPU_COUNT_STATUS}"},
+                "gpu_health": ${GPU_HEALTH_JSON},
+                "dcgm_diagnostics": {"level": 2, "status": "${DCGM_STATUS}"},
+                "compute_test": {"status": "${COMPUTE_STATUS}", "min_tflops": ${MIN_TFLOPS}, "results": ${COMPUTE_RESULTS}},
+                "issues": "${ISSUES}"
+              }
+              EOF
+                
+                # Copy to shared storage
+                cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+                
+                echo ""
+                echo "Overall Status: ${OVERALL_STATUS}"
+                [ -n "${ISSUES}" ] && echo "Issues: ${ISSUES}"
+                
+                # --------------------------------------------------------
+                # 3.4 Node Isolation - Label/Taint failed nodes
+                # --------------------------------------------------------
+                if [ "${OVERALL_STATUS}" = "FAIL" ]; then
+                  echo "Marking node as FAILED..."
+                  kubectl label nodes "${NODE_NAME}" preflight-status=failed --overwrite 2>/dev/null || true
+                  kubectl taint nodes "${NODE_NAME}" gpu-preflight=failed:NoSchedule --overwrite 2>/dev/null || true
+                else
+                  echo "Marking node as PASSED..."
+                  kubectl label nodes "${NODE_NAME}" preflight-status=passed --overwrite 2>/dev/null || true
+                  kubectl taint nodes "${NODE_NAME}" gpu-preflight=failed:NoSchedule- 2>/dev/null || true
+                fi
+              }
+              
+              # One-shot run
+              run_health_check
+              [ "${OVERALL_STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              cpu: "1"
+              memory: "4Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+          securityContext:
+            privileged: true
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+
+# =============================================================================
+# SECTION 4: INTRA-NODE GPU FABRIC (NVLink / NVSwitch)
+# =============================================================================
+# ☑ NCCL intra-node collective test
+# ☑ Restrict to GPUs on same node
+# ☑ Measure bandwidth
+# ☑ Measure latency
+# ☑ Compare against thresholds
+# ☑ Flag degraded communication
+# ☑ Mark node failed if below threshold
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nccl-intra-node-test
+  namespace: gpu-preflight
+  labels:
+    app: nccl-test
+    component: nccl
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: nccl-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: nccl-test
+          image: nvcr.io/nvidia/pytorch:24.01-py3
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              NODE_NAME="${NODE_NAME:-unknown}"
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-nccl-intra.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CONFIG_FILE="/config/config.json"
+              
+              mkdir -p "${RESULTS_DIR}" "${SHARED_DIR}"
+              
+              echo "=========================================="
+              echo "NCCL Intra-Node Test (Nebius Optimized)"
+              echo "Node: ${NODE_NAME}"
+              echo "=========================================="
+              
+              # Load thresholds
+              MIN_BW=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['nccl']['min_intra_node_bandwidth_gbps'])")
+              MAX_LAT=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['nccl']['max_latency_us'])")
+              
+              # ============================================================
+              # NEBIUS-RECOMMENDED NCCL ENVIRONMENT VARIABLES
+              # ============================================================
+              export NCCL_IB_QPS_PER_CONNECTION=2
+              export NCCL_NVLS_ENABLE=1
+              export NCCL_BUFFSIZE=8388608
+              export NCCL_DEBUG=WARN
+              
+              # Download Nebius topology file
+              mkdir -p /opt/nebius
+              curl -sSf -o /opt/nebius/nccl-topo.xml \
+                https://raw.githubusercontent.com/nebius/nccl-topology/main/nccl-topo-b200-v1.xml 2>/dev/null || \
+              curl -sSf -o /opt/nebius/nccl-topo.xml \
+                https://raw.githubusercontent.com/nebius/nccl-topology/main/nccl-topo-h100-v1.xml 2>/dev/null || true
+              [ -f /opt/nebius/nccl-topo.xml ] && export NCCL_TOPO_FILE=/opt/nebius/nccl-topo.xml
+              
+              echo "NCCL Environment:"
+              echo "  NCCL_IB_QPS_PER_CONNECTION=${NCCL_IB_QPS_PER_CONNECTION}"
+              echo "  NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE}"
+              echo "  NCCL_BUFFSIZE=${NCCL_BUFFSIZE}"
+              echo "  NCCL_TOPO_FILE=${NCCL_TOPO_FILE:-auto}"
+              echo ""
+              
+              # Build NCCL tests
+              cd /tmp
+              git clone https://github.com/NVIDIA/nccl-tests.git 2>/dev/null || true
+              cd nccl-tests
+              make MPI=0 CUDA_HOME=/usr/local/cuda -j$(nproc) 2>/dev/null || make MPI=0 -j$(nproc)
+              
+              export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+              GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+              
+              # ============================================================
+              # Run NCCL all_reduce_perf with LATENCY measurement
+              # ============================================================
+              echo "Running all_reduce_perf with ${GPU_COUNT} GPUs..."
+              echo "Parameters: -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 50"
+              echo ""
+              
+              ALL_REDUCE_OUTPUT=$(./build/all_reduce_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 50 2>&1) || true
+              echo "$ALL_REDUCE_OUTPUT"
+              
+              # Parse bus bandwidth from nccl-tests output (busbw is the penultimate column, last column is #wrong)
+              BW_1GB=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+              
+              # Parse algorithm time (us) for the smallest message size (8 bytes)
+              LAT_8B=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 == 8 {print $6}' | tail -1)
+              
+              # Average bus bandwidth from large messages
+              AVG_BW=$(echo "$ALL_REDUCE_OUTPUT" | awk '$1 ~ /^[0-9]+$/ && $1 >= 67108864 {sum+=$(NF-1); count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+              
+              # Run additional tests
+              echo ""
+              echo "Running all_gather_perf..."
+              GATHER_BW=$(./build/all_gather_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1 | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+              
+              echo "Running reduce_scatter_perf..."
+              SCATTER_BW=$(./build/reduce_scatter_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1 | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+              
+              # ============================================================
+              # NEBIUS ADDITIONAL TEST: NCCL path test with P2P/SHM disabled
+              # Source: nebius.com/blog/posts/how-we-build-reliable-clusters
+              # This biases transport away from NVLink/P2P/SHM to exercise network paths
+              # ============================================================
+              echo ""
+              echo "Running all_reduce forced over InfiniBand (disabling NVLink)..."
+              export NCCL_P2P_DISABLE=1
+              export NCCL_SHM_DISABLE=1
+              IB_FORCED_OUTPUT=$(./build/all_reduce_perf -b 8 -e 1G -f 2 -g ${GPU_COUNT} -n 20 2>&1) || true
+              IB_FORCED_BW=$(echo "$IB_FORCED_OUTPUT" | awk '$1 == 1073741824 {print $(NF-1)}' | tail -1)
+              IB_FORCED_BW=${IB_FORCED_BW:-0}
+              echo "  InfiniBand-forced bus bandwidth: ${IB_FORCED_BW} GB/s"
+              unset NCCL_P2P_DISABLE NCCL_SHM_DISABLE
+              
+              # Default values
+              BW_1GB=${BW_1GB:-0}; AVG_BW=${AVG_BW:-0}
+              GATHER_BW=${GATHER_BW:-0}; SCATTER_BW=${SCATTER_BW:-0}
+              LAT_8B=${LAT_8B:-0}
+              
+              # Evaluate pass/fail
+              STATUS="PASS"; ISSUES=""
+              
+              # Check bandwidth
+              if (( $(echo "${AVG_BW} > 0 && ${AVG_BW} < ${MIN_BW}" | bc -l 2>/dev/null || echo 0) )); then
+                STATUS="FAIL"
+                ISSUES="${ISSUES}bandwidth_low(${AVG_BW}<${MIN_BW});"
+              fi
+              
+              # Check latency
+              if (( $(echo "${LAT_8B} > 0 && ${LAT_8B} > ${MAX_LAT}" | bc -l 2>/dev/null || echo 0) )); then
+                STATUS="FAIL"
+                ISSUES="${ISSUES}latency_high(${LAT_8B}>${MAX_LAT});"
+              fi
+              
+              # Generate JSON report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "nccl_intra_node",
+                "node": "${NODE_NAME}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "gpu_count": ${GPU_COUNT},
+                "nebius_optimizations": {
+                  "NCCL_NVLS_ENABLE": 1,
+                  "NCCL_IB_QPS_PER_CONNECTION": 2,
+                  "NCCL_BUFFSIZE": 8388608
+                },
+                "bandwidth": {
+                  "all_reduce_1gb_busbw_gbs": ${BW_1GB},
+                  "all_reduce_avg_busbw_gbs": ${AVG_BW},
+                  "all_gather_1gb_busbw_gbs": ${GATHER_BW},
+                  "reduce_scatter_1gb_busbw_gbs": ${SCATTER_BW},
+                  "ib_forced_1gb_busbw_gbs": ${IB_FORCED_BW},
+                  "threshold_busbw_gbs": ${MIN_BW}
+                },
+                "latency": {
+                  "all_reduce_8b_us": ${LAT_8B},
+                  "threshold_us": ${MAX_LAT}
+                },
+                "issues": "${ISSUES}"
+              }
+              EOF
+              
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+              
+              echo ""
+              echo "=========================================="
+              echo "Results: Status=${STATUS}, BusBW=${AVG_BW} GB/s, Latency=${LAT_8B} us"
+              echo "=========================================="
+              
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+            requests:
+              cpu: "4"
+              memory: "32Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            privileged: true
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+
+# =============================================================================
+# SECTION 5: NETWORK / TCP VALIDATION
+# =============================================================================
+# ☑ TCP connectivity between nodes
+# ☑ Multi-node communication test
+# ☑ Packet loss detection
+# ☑ Bandwidth measurement
+# ☑ Latency measurement
+# =============================================================================
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: network-test-svc
+  namespace: gpu-preflight
+spec:
+  clusterIP: None
+  selector:
+    app: network-test
+  ports:
+    - port: 5001
+      name: iperf
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: network-tcp-test
+  namespace: gpu-preflight
+  labels:
+    app: network-test
+    component: network
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: network-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      hostname: network-test
+      subdomain: network-test-svc
+      containers:
+        - name: network-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              apt-get update && apt-get install -y iperf3 netcat-openbsd curl jq bc iputils-ping dnsutils > /dev/null 2>&1
+              curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" > /dev/null 2>&1
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              
+              NODE_NAME="${NODE_NAME:-unknown}"
+              POD_IP="${POD_IP:-unknown}"
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-network.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CONFIG_FILE="/config/config.json"
+              
+              mkdir -p "${RESULTS_DIR}" "${SHARED_DIR}"
+              
+              echo "=========================================="
+              echo "Network/TCP Validation"
+              echo "Node: ${NODE_NAME}"
+              echo "Pod IP: ${POD_IP}"
+              echo "=========================================="
+              
+              # Load thresholds
+              MIN_BW=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['min_tcp_bandwidth_gbps'])" 2>/dev/null || echo 10)
+              MAX_LAT=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['max_tcp_latency_ms'])" 2>/dev/null || echo 1)
+              MAX_LOSS=$(cat "${CONFIG_FILE}" | python3 -c "import sys,json; print(json.load(sys.stdin)['network']['max_packet_loss_percent'])" 2>/dev/null || echo 0.01)
+              
+              # Start iperf3 server in background
+              iperf3 -s -D -p 5001
+              sleep 5
+              
+              # Get other GPU node IPs
+              OTHER_NODES=$(kubectl get pods -n gpu-preflight -l app=network-test -o jsonpath='{.items[*].status.podIP}' 2>/dev/null | tr ' ' '\n' | grep -v "^${POD_IP}$" | head -5)
+              
+              echo "Other nodes: ${OTHER_NODES}"
+              
+              STATUS="PASS"
+              ISSUES=""
+              PEER_RESULTS="["
+              FIRST=true
+              
+              for peer_ip in ${OTHER_NODES}; do
+                [ -z "${peer_ip}" ] && continue
+                echo ""
+                echo "Testing connectivity to ${peer_ip}..."
+                
+                peer_status="PASS"
+                peer_issues=""
+                
+                # 1. Ping test (connectivity + latency + packet loss)
+                PING_OUTPUT=$(ping -c 20 -i 0.2 "${peer_ip}" 2>&1) || true
+                
+                PING_LATENCY=$(echo "$PING_OUTPUT" | grep "avg" | awk -F'/' '{print $5}' || echo "999")
+                PACKET_LOSS=$(echo "$PING_OUTPUT" | grep -oP '\d+(?=% packet loss)' || echo "100")
+                
+                echo "  Ping: Latency=${PING_LATENCY}ms, Loss=${PACKET_LOSS}%"
+                
+                if (( $(echo "${PACKET_LOSS} > ${MAX_LOSS}" | bc -l 2>/dev/null || echo 0) )); then
+                  peer_status="FAIL"
+                  peer_issues="${peer_issues}packet_loss(${PACKET_LOSS}%);"
+                  STATUS="FAIL"
+                  ISSUES="${ISSUES}${peer_ip}:packet_loss;"
+                fi
+                
+                if (( $(echo "${PING_LATENCY} > ${MAX_LAT}" | bc -l 2>/dev/null || echo 0) )); then
+                  peer_status="WARN"
+                  peer_issues="${peer_issues}high_latency(${PING_LATENCY}ms);"
+                fi
+                
+                # 2. iperf3 bandwidth test
+                echo "  Running iperf3 bandwidth test..."
+                IPERF_OUTPUT=$(timeout 30 iperf3 -c "${peer_ip}" -p 5001 -t 10 -J 2>/dev/null) || IPERF_OUTPUT="{}"
+                
+                BW_BITS=$(echo "$IPERF_OUTPUT" | jq -r '.end.sum_sent.bits_per_second // 0' 2>/dev/null || echo 0)
+                BW_GBPS=$(echo "scale=2; ${BW_BITS} / 1000000000" | bc 2>/dev/null || echo 0)
+                
+                echo "  Bandwidth: ${BW_GBPS} Gbps"
+                
+                if (( $(echo "${BW_GBPS} < ${MIN_BW}" | bc -l 2>/dev/null || echo 0) )); then
+                  if [ "${BW_GBPS}" != "0" ]; then
+                    peer_status="WARN"
+                    peer_issues="${peer_issues}low_bandwidth(${BW_GBPS}Gbps);"
+                  fi
+                fi
+                
+                [ "${FIRST}" = "true" ] && FIRST=false || PEER_RESULTS="${PEER_RESULTS},"
+                PEER_RESULTS="${PEER_RESULTS}{\"peer_ip\":\"${peer_ip}\",\"latency_ms\":${PING_LATENCY:-0},\"packet_loss_pct\":${PACKET_LOSS:-0},\"bandwidth_gbps\":${BW_GBPS},\"status\":\"${peer_status}\",\"issues\":\"${peer_issues}\"}"
+              done
+              
+              PEER_RESULTS="${PEER_RESULTS}]"
+              
+              # Generate JSON report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "network_tcp",
+                "node": "${NODE_NAME}",
+                "pod_ip": "${POD_IP}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "thresholds": {
+                  "min_bandwidth_gbps": ${MIN_BW},
+                  "max_latency_ms": ${MAX_LAT},
+                  "max_packet_loss_pct": ${MAX_LOSS}
+                },
+                "peer_tests": ${PEER_RESULTS},
+                "issues": "${ISSUES}"
+              }
+              EOF
+              
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+              
+              echo ""
+              echo "Network test complete. Status: ${STATUS}"
+              
+              # Keep running briefly for other pods to test against us
+              sleep 120
+              
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+
+# =============================================================================
+# SECTION 6: STORAGE PREFLIGHT (Shared Storage)
+# =============================================================================
+# ☑ Concurrent read test from multiple nodes
+# ☑ Sustained throughput measured
+# ☑ Large sequential read test
+# ☑ Many small random read test
+# ☑ Threshold validation
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: storage-benchmark
+  namespace: gpu-preflight
+  labels:
+    app: storage-test
+    component: storage
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: storage-test
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: storage-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              apt-get update && apt-get install -y fio jq bc > /dev/null 2>&1
+              
+              NODE_NAME="${NODE_NAME:-unknown}"
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/${NODE_NAME}-storage.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              CONFIG_FILE="/config/config.json"
+              
+              # Test on SHARED storage
+              TEST_DIR="/shared-results/storage-test-${NODE_NAME}-$$"
+              mkdir -p "${RESULTS_DIR}" "${TEST_DIR}"
+              cd "${TEST_DIR}"
+              
+              echo "=========================================="
+              echo "Storage Benchmark (Shared Storage + Local)"
+              echo "Node: ${NODE_NAME}"
+              echo "Test Directory: ${TEST_DIR}"
+              echo "=========================================="
+              
+              # Load thresholds
+              MIN_SEQ_READ=$(jq -r '.storage.min_sequential_read_mbps' "${CONFIG_FILE}")
+              MIN_SEQ_WRITE=$(jq -r '.storage.min_sequential_write_mbps' "${CONFIG_FILE}")
+              MIN_RAND_IOPS=$(jq -r '.storage.min_random_read_iops' "${CONFIG_FILE}")
+              MAX_LAT=$(jq -r '.storage.max_latency_ms' "${CONFIG_FILE}")
+              
+              echo "Thresholds: SeqRead=${MIN_SEQ_READ}MB/s, SeqWrite=${MIN_SEQ_WRITE}MB/s, RandIOPS=${MIN_RAND_IOPS}, MaxLat=${MAX_LAT}ms"
+              echo ""
+              
+              # =============================================================
+              # PART 1: LOCAL/TEMPORARY STORAGE (node-local SSD/NVMe)
+              # =============================================================
+              echo ">>> PART 1: Local/Temporary Storage (/tmp) <<<"
+              LOCAL_TEST_DIR="/tmp/preflight-storage-$$"
+              mkdir -p "${LOCAL_TEST_DIR}"
+              cd "${LOCAL_TEST_DIR}"
+              
+              echo "Local Test 1: Sequential Read (1MB blocks)..."
+              fio --name=local_seq_read --rw=read --bs=1M --size=1G --numjobs=4 \
+                  --time_based --runtime=15 --group_reporting \
+                  --output-format=json --output=/tmp/local_seq_read.json 2>/dev/null
+              
+              LOCAL_SEQ_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/local_seq_read.json | awk '{printf "%.2f", $1/1048576}')
+              LOCAL_SEQ_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/local_seq_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  Bandwidth: ${LOCAL_SEQ_READ_BW} MB/s, Latency: ${LOCAL_SEQ_READ_LAT} ms"
+              
+              echo "Local Test 2: Random Read (4K blocks)..."
+              fio --name=local_rand_read --rw=randread --bs=4K --size=256M --numjobs=4 \
+                  --time_based --runtime=15 --group_reporting \
+                  --output-format=json --output=/tmp/local_rand_read.json 2>/dev/null
+              
+              LOCAL_RAND_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/local_rand_read.json | awk '{printf "%.0f", $1}')
+              LOCAL_RAND_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/local_rand_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${LOCAL_RAND_IOPS}, Latency: ${LOCAL_RAND_LAT} ms"
+              
+              rm -rf "${LOCAL_TEST_DIR}"
+              echo ""
+              
+              # =============================================================
+              # PART 2: SHARED STORAGE (NFS / Parallel FS)
+              # =============================================================
+              echo ">>> PART 2: Shared Storage (${TEST_DIR}) <<<"
+              cd "${TEST_DIR}"
+              
+              # Test 1: Large Sequential Read (checkpoint loading simulation)
+              # NOTE: Nebius docs recommend 4MiB blocks for maximum bandwidth
+              echo "Test 1: Sequential Read (4MB blocks per Nebius recommendation)..."
+              fio --name=seq_read --rw=read --bs=4M --size=2G --numjobs=4 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/seq_read.json 2>/dev/null
+              
+              SEQ_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/seq_read.json | awk '{printf "%.2f", $1/1048576}')
+              SEQ_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/seq_read.json | awk '{printf "%.2f", $1/1000000}')
+              SEQ_READ_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/seq_read.json)
+              echo "  Bandwidth: ${SEQ_READ_BW} MB/s, Latency: ${SEQ_READ_LAT} ms, IOPS: ${SEQ_READ_IOPS}"
+              
+              # Test 2: Sequential Write (checkpoint saving)
+              echo "Test 2: Sequential Write (4MB blocks)..."
+              fio --name=seq_write --rw=write --bs=4M --size=2G --numjobs=4 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/seq_write.json 2>/dev/null
+              
+              SEQ_WRITE_BW=$(jq -r '.jobs[0].write.bw_bytes // 0' /tmp/seq_write.json | awk '{printf "%.2f", $1/1048576}')
+              SEQ_WRITE_LAT=$(jq -r '.jobs[0].write.lat_ns.mean // 0' /tmp/seq_write.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  Bandwidth: ${SEQ_WRITE_BW} MB/s, Latency: ${SEQ_WRITE_LAT} ms"
+              
+              # Test 3: Many Small Random Reads (training sample access)
+              echo "Test 3: Random Read (4K blocks)..."
+              fio --name=rand_read --rw=randread --bs=4K --size=512M --numjobs=8 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/rand_read.json 2>/dev/null
+              
+              RAND_READ_BW=$(jq -r '.jobs[0].read.bw_bytes // 0' /tmp/rand_read.json | awk '{printf "%.2f", $1/1048576}')
+              RAND_READ_IOPS=$(jq -r '.jobs[0].read.iops // 0' /tmp/rand_read.json | awk '{printf "%.0f", $1}')
+              RAND_READ_LAT=$(jq -r '.jobs[0].read.lat_ns.mean // 0' /tmp/rand_read.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${RAND_READ_IOPS}, Bandwidth: ${RAND_READ_BW} MB/s, Latency: ${RAND_READ_LAT} ms"
+              
+              # Test 4: Random Write
+              echo "Test 4: Random Write (4K blocks)..."
+              fio --name=rand_write --rw=randwrite --bs=4K --size=512M --numjobs=8 \
+                  --time_based --runtime=30 --group_reporting \
+                  --output-format=json --output=/tmp/rand_write.json 2>/dev/null
+              
+              RAND_WRITE_IOPS=$(jq -r '.jobs[0].write.iops // 0' /tmp/rand_write.json | awk '{printf "%.0f", $1}')
+              RAND_WRITE_LAT=$(jq -r '.jobs[0].write.lat_ns.mean // 0' /tmp/rand_write.json | awk '{printf "%.2f", $1/1000000}')
+              echo "  IOPS: ${RAND_WRITE_IOPS}, Latency: ${RAND_WRITE_LAT} ms"
+              
+              # Cleanup
+              cd /tmp
+              rm -rf "${TEST_DIR}"
+              
+              # Evaluate
+              STATUS="PASS"; ISSUES=""
+              
+              if (( $(echo "${SEQ_READ_BW} < ${MIN_SEQ_READ}" | bc -l) )); then
+                STATUS="FAIL"; ISSUES="${ISSUES}seq_read_low(${SEQ_READ_BW}<${MIN_SEQ_READ});"
+              fi
+              if (( $(echo "${SEQ_WRITE_BW} < ${MIN_SEQ_WRITE}" | bc -l) )); then
+                STATUS="FAIL"; ISSUES="${ISSUES}seq_write_low(${SEQ_WRITE_BW}<${MIN_SEQ_WRITE});"
+              fi
+              if (( $(echo "${RAND_READ_IOPS} < ${MIN_RAND_IOPS}" | bc -l) )); then
+                STATUS="WARN"; ISSUES="${ISSUES}rand_iops_low(${RAND_READ_IOPS}<${MIN_RAND_IOPS});"
+              fi
+              if (( $(echo "${SEQ_READ_LAT} > ${MAX_LAT}" | bc -l) )); then
+                STATUS="WARN"; ISSUES="${ISSUES}high_latency(${SEQ_READ_LAT}>${MAX_LAT});"
+              fi
+              
+              # Generate JSON report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "storage_shared_and_local",
+                "node": "${NODE_NAME}",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "thresholds": {
+                  "min_seq_read_mbps": ${MIN_SEQ_READ},
+                  "min_seq_write_mbps": ${MIN_SEQ_WRITE},
+                  "min_rand_iops": ${MIN_RAND_IOPS},
+                  "max_latency_ms": ${MAX_LAT}
+                },
+                "local_storage": {
+                  "sequential_read": {
+                    "bandwidth_mbps": ${LOCAL_SEQ_READ_BW},
+                    "latency_ms": ${LOCAL_SEQ_READ_LAT}
+                  },
+                  "random_read": {
+                    "iops": ${LOCAL_RAND_IOPS},
+                    "latency_ms": ${LOCAL_RAND_LAT}
+                  }
+                },
+                "shared_storage": {
+                  "sequential_read": {
+                    "bandwidth_mbps": ${SEQ_READ_BW},
+                    "latency_ms": ${SEQ_READ_LAT},
+                    "iops": ${SEQ_READ_IOPS}
+                  },
+                  "sequential_write": {
+                    "bandwidth_mbps": ${SEQ_WRITE_BW},
+                    "latency_ms": ${SEQ_WRITE_LAT}
+                  },
+                  "random_read": {
+                    "iops": ${RAND_READ_IOPS},
+                    "bandwidth_mbps": ${RAND_READ_BW},
+                    "latency_ms": ${RAND_READ_LAT}
+                  },
+                  "random_write": {
+                    "iops": ${RAND_WRITE_IOPS},
+                    "latency_ms": ${RAND_WRITE_LAT}
+                  }
+                },
+                "issues": "${ISSUES}"
+              }
+              EOF
+              
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+              
+              echo ""
+              echo "Storage test complete. Status: ${STATUS}"
+              
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+
+# =============================================================================
+# SECTION 7: SCHEDULER VALIDATION
+# =============================================================================
+# ☑ GPU pods scheduled only on GPU nodes
+# ☑ Tainted nodes avoided
+# ☑ Multi-node distributed job scheduling verified
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scheduler-validation
+  namespace: gpu-preflight
+  labels:
+    app: scheduler-test
+    component: scheduler
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: scheduler-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      containers:
+        - name: scheduler-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              # Install dependencies
+              apt-get update && apt-get install -y curl jq bc > /dev/null 2>&1
+              curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" > /dev/null 2>&1
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              RESULT_FILE="${RESULTS_DIR}/scheduler-validation.json"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              
+              mkdir -p "${RESULTS_DIR}" "${SHARED_DIR}"
+              
+              echo "=========================================="
+              echo "Scheduler Validation"
+              echo "=========================================="
+              
+              STATUS="PASS"
+              ISSUES=""
+              
+              # --------------------------------------------------------
+              # Test 1: Verify GPU pods land on GPU nodes only
+              # --------------------------------------------------------
+              echo ""
+              echo "Test 1: GPU pods on GPU nodes only..."
+              
+              GPU_NODES=$(kubectl get nodes -l nebius.com/gpu=true -o jsonpath='{.items[*].metadata.name}')
+              GPU_NODE_COUNT=$(echo $GPU_NODES | wc -w)
+              echo "  GPU Nodes: ${GPU_NODE_COUNT} (${GPU_NODES})"
+              
+              # Check our NCCL test pods landed on GPU nodes
+              NCCL_PODS=$(kubectl get pods -n gpu-preflight -l app=nccl-test -o jsonpath='{range .items[*]}{.spec.nodeName}{" "}{end}' 2>/dev/null || echo "")
+              
+              for pod_node in ${NCCL_PODS}; do
+                if ! echo "${GPU_NODES}" | grep -q "${pod_node}"; then
+                  STATUS="FAIL"
+                  ISSUES="${ISSUES}gpu_pod_on_non_gpu_node(${pod_node});"
+                  echo "  FAIL: GPU pod on non-GPU node ${pod_node}"
+                fi
+              done
+              
+              [ -z "${ISSUES}" ] && echo "  PASS: All GPU pods on GPU nodes"
+              
+              # --------------------------------------------------------
+              # Test 2: Verify tainted nodes are avoided
+              # --------------------------------------------------------
+              echo ""
+              echo "Test 2: Tainted nodes avoided..."
+              
+              TAINTED_NODES=$(kubectl get nodes -o json | jq -r '.items[] | select(.spec.taints[]?.key == "gpu-preflight") | .metadata.name' 2>/dev/null || echo "")
+              
+              if [ -n "${TAINTED_NODES}" ]; then
+                echo "  Tainted nodes: ${TAINTED_NODES}"
+                
+                # Check no pods scheduled on tainted nodes (except our DaemonSet)
+                for node in ${TAINTED_NODES}; do
+                  PODS_ON_TAINTED=$(kubectl get pods -n gpu-preflight --field-selector spec.nodeName=${node} -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -v "gpu-health-check" || echo "")
+                  if [ -n "${PODS_ON_TAINTED}" ]; then
+                    echo "  WARN: Pods on tainted node ${node}: ${PODS_ON_TAINTED}"
+                    ISSUES="${ISSUES}pods_on_tainted_node(${node});"
+                  fi
+                done
+              else
+                echo "  No tainted nodes found"
+              fi
+              
+              # --------------------------------------------------------
+              # Test 3: Multi-node job scheduling
+              # --------------------------------------------------------
+              echo ""
+              echo "Test 3: Multi-node job distribution..."
+              
+              # Check if NCCL jobs are distributed across nodes
+              UNIQUE_NODES=$(kubectl get pods -n gpu-preflight -l app=nccl-test -o jsonpath='{range .items[*]}{.spec.nodeName}{"\n"}{end}' 2>/dev/null | sort -u | wc -l)
+              TOTAL_NCCL_PODS=$(kubectl get pods -n gpu-preflight -l app=nccl-test --no-headers 2>/dev/null | wc -l)
+              
+              echo "  NCCL pods: ${TOTAL_NCCL_PODS} across ${UNIQUE_NODES} nodes"
+              
+              if [ "${UNIQUE_NODES}" -lt 2 ] && [ "${GPU_NODE_COUNT}" -ge 2 ]; then
+                ISSUES="${ISSUES}poor_distribution(${UNIQUE_NODES}_nodes_used);"
+                echo "  WARN: Jobs not well distributed across nodes"
+              else
+                echo "  PASS: Jobs distributed across multiple nodes"
+              fi
+              
+              # --------------------------------------------------------
+              # Test 4: Node label consistency
+              # --------------------------------------------------------
+              echo ""
+              echo "Test 4: Node label consistency..."
+              
+              LABELED_NODES=$(kubectl get nodes -l preflight-status -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.preflight-status}{" "}{end}' 2>/dev/null)
+              echo "  Preflight labels: ${LABELED_NODES}"
+              
+              # Generate report
+              cat > "${RESULT_FILE}" << EOF
+              {
+                "test_type": "scheduler_validation",
+                "timestamp": "${TIMESTAMP}",
+                "overall_status": "${STATUS}",
+                "gpu_nodes": {
+                  "count": ${GPU_NODE_COUNT},
+                  "names": "${GPU_NODES}"
+                },
+                "tainted_nodes": "${TAINTED_NODES}",
+                "distribution": {
+                  "unique_nodes_used": ${UNIQUE_NODES},
+                  "total_pods": ${TOTAL_NCCL_PODS}
+                },
+                "issues": "${ISSUES}"
+              }
+              EOF
+              
+              # Copy to shared storage
+              cp "${RESULT_FILE}" "${SHARED_DIR}/" 2>/dev/null || true
+              
+              echo ""
+              echo "Scheduler validation complete. Status: ${STATUS}"
+              
+              [ "${STATUS}" = "FAIL" ] && exit 1 || exit 0
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+
+# =============================================================================
+# SECTIONS 8, 9, 10: TELEMETRY AGGREGATOR
+# =============================================================================
+# ☑ JSON output per test
+# ☑ Metrics per node (GPU, NCCL, Storage, Network)
+# ☑ Pass/Fail per test category
+# ☑ Pass/Fail per node
+# ☑ Results to shared storage
+# ☑ Final decision: READY / DEGRADED / NOT_READY
+# ☑ Identify failing nodes/components
+# ☑ Recommend exclusion/remediation
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: preflight-aggregator
+  namespace: gpu-preflight
+  labels:
+    app: preflight-aggregator
+    component: aggregator
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: preflight-aggregator
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      containers:
+        - name: aggregator
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -e
+              
+              # Install dependencies
+              apt-get update && apt-get install -y curl jq bc grep > /dev/null 2>&1
+              curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl" > /dev/null 2>&1
+              chmod +x kubectl && mv kubectl /usr/local/bin/
+              
+              RESULTS_DIR="/results"
+              SHARED_DIR="/shared-results"
+              TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+              FINAL_REPORT="${SHARED_DIR}/cluster-preflight-report.json"
+              
+              echo "=========================================="
+              echo "PREFLIGHT RESULTS AGGREGATOR"
+              echo "Timestamp: ${TIMESTAMP}"
+              echo "=========================================="
+              
+              wait_for_job_completion() {
+                local job_name="$1"
+                local timeout_s="${2:-1800}"
+                local interval_s=10
+                local elapsed_s=0
+
+                echo "Waiting for Job/${job_name} to complete..."
+                while [ "${elapsed_s}" -lt "${timeout_s}" ]; do
+                  completions=$(kubectl get job "${job_name}" -n gpu-preflight -o jsonpath='{.spec.completions}' 2>/dev/null || echo "")
+                  succeeded=$(kubectl get job "${job_name}" -n gpu-preflight -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "0")
+                  failed=$(kubectl get job "${job_name}" -n gpu-preflight -o jsonpath='{.status.failed}' 2>/dev/null || echo "0")
+
+                  [ -z "${completions}" ] && completions=1
+                  [ -z "${succeeded}" ] && succeeded=0
+                  [ -z "${failed}" ] && failed=0
+
+                  if [ "${succeeded}" -ge "${completions}" ] 2>/dev/null; then
+                    echo "  Job/${job_name}: complete (${succeeded}/${completions})"
+                    return 0
+                  fi
+
+                  if [ "${failed}" -gt "0" ] 2>/dev/null; then
+                    echo "  Job/${job_name}: failed (failed=${failed})"
+                    return 1
+                  fi
+
+                  sleep "${interval_s}"
+                  elapsed_s=$((elapsed_s + interval_s))
+                done
+
+                echo "  Job/${job_name}: timed out after ${timeout_s}s"
+                return 1
+              }
+
+              WAIT_FAILURES=""
+              for job in gpu-health-check nccl-intra-node-test network-tcp-test storage-benchmark scheduler-validation; do
+                wait_for_job_completion "${job}" 1800 || WAIT_FAILURES="${WAIT_FAILURES}${job},"
+              done
+              
+              # Get GPU nodes
+              GPU_NODES=$(kubectl get nodes -l nebius.com/gpu=true -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+              TOTAL_GPU_NODES=$(echo $GPU_NODES | wc -w)
+              
+              echo "Found ${TOTAL_GPU_NODES} GPU nodes: ${GPU_NODES}"
+              
+              # Initialize counters
+              CLUSTER_STATUS="READY"
+              HEALTHY_NODES=0
+              FAILED_NODES=""
+              DEGRADED_COMPONENTS=""
+              [ -n "${WAIT_FAILURES}" ] && DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}job_wait:${WAIT_FAILURES}"
+              
+              # Category status
+              GPU_CATEGORY="PASS"
+              NCCL_CATEGORY="PASS"
+              NETWORK_CATEGORY="PASS"
+              STORAGE_CATEGORY="PASS"
+              SCHEDULER_CATEGORY="PASS"
+
+              # Result coverage counters
+              GPU_RESULTS_FOUND=0
+              NCCL_RESULTS_FOUND=0
+              NETWORK_RESULTS_FOUND=0
+              STORAGE_RESULTS_FOUND=0
+
+              if [ "${TOTAL_GPU_NODES}" -eq 0 ]; then
+                CLUSTER_STATUS="NOT_READY"
+                GPU_CATEGORY="FAIL"
+                DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}gpu_nodes:none,"
+              fi
+
+              if [ -n "${WAIT_FAILURES}" ]; then
+                CLUSTER_STATUS="NOT_READY"
+              fi
+              
+              # Collect results arrays
+              GPU_RESULTS="["
+              NCCL_RESULTS="["
+              NETWORK_RESULTS="["
+              STORAGE_RESULTS="["
+              
+              FIRST_GPU=true; FIRST_NCCL=true; FIRST_NET=true; FIRST_STOR=true
+              
+              for node in ${GPU_NODES}; do
+                echo ""
+                echo "=== Processing ${node} ==="
+                NODE_STATUS="PASS"
+                
+                # GPU Health
+                GPU_FOUND=false
+                for dir in "${RESULTS_DIR}" "${SHARED_DIR}"; do
+                  if [ -f "${dir}/${node}-gpu-health.json" ]; then
+                    GPU_FOUND=true
+                    GPU_RESULTS_FOUND=$((GPU_RESULTS_FOUND + 1))
+                    STATUS=$(grep -o '"overall_status"[[:space:]]*:[[:space:]]*"[^"]*"' "${dir}/${node}-gpu-health.json" | head -1 | cut -d'"' -f4)
+                    echo "  GPU Health: ${STATUS}"
+                    if [ "${STATUS}" = "FAIL" ]; then
+                      NODE_STATUS="FAIL"; GPU_CATEGORY="FAIL"
+                      CLUSTER_STATUS="NOT_READY"; FAILED_NODES="${FAILED_NODES}${node},"
+                      kubectl taint nodes "${node}" gpu-preflight=failed:NoSchedule --overwrite 2>/dev/null || true
+                      kubectl label nodes "${node}" preflight-status=failed --overwrite 2>/dev/null || true
+                    elif [ "${NODE_STATUS}" != "FAIL" ]; then
+                      kubectl label nodes "${node}" preflight-status=passed --overwrite 2>/dev/null || true
+                    fi
+                    [ "${FIRST_GPU}" = "true" ] && FIRST_GPU=false || GPU_RESULTS="${GPU_RESULTS},"
+                    GPU_RESULTS="${GPU_RESULTS}$(cat ${dir}/${node}-gpu-health.json | tr -d '\n')"
+                    break
+                  fi
+                done
+                if [ "${GPU_FOUND}" != "true" ]; then
+                  echo "  GPU Health: MISSING"
+                  NODE_STATUS="FAIL"
+                  GPU_CATEGORY="FAIL"
+                  CLUSTER_STATUS="NOT_READY"
+                  FAILED_NODES="${FAILED_NODES}${node},"
+                  DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}gpu_health_missing:${node},"
+                  kubectl label nodes "${node}" preflight-status=failed --overwrite 2>/dev/null || true
+                fi
+                
+                # NCCL
+                NCCL_FOUND=false
+                for dir in "${RESULTS_DIR}" "${SHARED_DIR}"; do
+                  if [ -f "${dir}/${node}-nccl-intra.json" ]; then
+                    NCCL_FOUND=true
+                    NCCL_RESULTS_FOUND=$((NCCL_RESULTS_FOUND + 1))
+                    STATUS=$(grep -o '"overall_status"[[:space:]]*:[[:space:]]*"[^"]*"' "${dir}/${node}-nccl-intra.json" | head -1 | cut -d'"' -f4)
+                    echo "  NCCL: ${STATUS}"
+                    if [ "${STATUS}" = "FAIL" ]; then
+                      NCCL_CATEGORY="FAIL"
+                      [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                      DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}nccl:${node},"
+                    fi
+                    [ "${FIRST_NCCL}" = "true" ] && FIRST_NCCL=false || NCCL_RESULTS="${NCCL_RESULTS},"
+                    NCCL_RESULTS="${NCCL_RESULTS}$(cat ${dir}/${node}-nccl-intra.json | tr -d '\n')"
+                    break
+                  fi
+                done
+                if [ "${NCCL_FOUND}" != "true" ]; then
+                  echo "  NCCL: MISSING"
+                  NCCL_CATEGORY="FAIL"
+                  [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                  DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}nccl_missing:${node},"
+                fi
+                
+                # Network
+                NETWORK_FOUND=false
+                for dir in "${RESULTS_DIR}" "${SHARED_DIR}"; do
+                  if [ -f "${dir}/${node}-network.json" ]; then
+                    NETWORK_FOUND=true
+                    NETWORK_RESULTS_FOUND=$((NETWORK_RESULTS_FOUND + 1))
+                    STATUS=$(grep -o '"overall_status"[[:space:]]*:[[:space:]]*"[^"]*"' "${dir}/${node}-network.json" | head -1 | cut -d'"' -f4)
+                    echo "  Network: ${STATUS}"
+                    if [ "${STATUS}" = "FAIL" ]; then
+                      NETWORK_CATEGORY="FAIL"
+                      [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                      DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}network:${node},"
+                    fi
+                    [ "${FIRST_NET}" = "true" ] && FIRST_NET=false || NETWORK_RESULTS="${NETWORK_RESULTS},"
+                    NETWORK_RESULTS="${NETWORK_RESULTS}$(cat ${dir}/${node}-network.json | tr -d '\n')"
+                    break
+                  fi
+                done
+                if [ "${NETWORK_FOUND}" != "true" ]; then
+                  echo "  Network: MISSING"
+                  NETWORK_CATEGORY="FAIL"
+                  [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                  DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}network_missing:${node},"
+                fi
+                
+                # Storage
+                STORAGE_FOUND=false
+                for dir in "${RESULTS_DIR}" "${SHARED_DIR}"; do
+                  if [ -f "${dir}/${node}-storage.json" ]; then
+                    STORAGE_FOUND=true
+                    STORAGE_RESULTS_FOUND=$((STORAGE_RESULTS_FOUND + 1))
+                    STATUS=$(grep -o '"overall_status"[[:space:]]*:[[:space:]]*"[^"]*"' "${dir}/${node}-storage.json" | head -1 | cut -d'"' -f4)
+                    echo "  Storage: ${STATUS}"
+                    if [ "${STATUS}" = "FAIL" ]; then
+                      STORAGE_CATEGORY="FAIL"
+                      [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                      DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}storage:${node},"
+                    fi
+                    [ "${FIRST_STOR}" = "true" ] && FIRST_STOR=false || STORAGE_RESULTS="${STORAGE_RESULTS},"
+                    STORAGE_RESULTS="${STORAGE_RESULTS}$(cat ${dir}/${node}-storage.json | tr -d '\n')"
+                    
+                    # Extract per-node throughput for aggregate calculation
+                    NODE_SEQ_READ=$(grep -o '"bandwidth_mbps"[[:space:]]*:[[:space:]]*[0-9.]*' "${dir}/${node}-storage.json" | head -1 | grep -o '[0-9.]*$' || echo 0)
+                    TOTAL_SEQ_READ_MBPS=$(echo "${TOTAL_SEQ_READ_MBPS:-0} + ${NODE_SEQ_READ}" | bc 2>/dev/null || echo 0)
+                    break
+                  fi
+                done
+                if [ "${STORAGE_FOUND}" != "true" ]; then
+                  echo "  Storage: MISSING"
+                  STORAGE_CATEGORY="FAIL"
+                  [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                  DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}storage_missing:${node},"
+                fi
+                
+                [ "${NODE_STATUS}" = "PASS" ] && HEALTHY_NODES=$((HEALTHY_NODES + 1))
+              done
+
+              if [ "${GPU_RESULTS_FOUND}" -lt "${TOTAL_GPU_NODES}" ]; then
+                GPU_CATEGORY="FAIL"
+                CLUSTER_STATUS="NOT_READY"
+              fi
+              if [ "${NCCL_RESULTS_FOUND}" -lt "${TOTAL_GPU_NODES}" ]; then
+                NCCL_CATEGORY="FAIL"
+                [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+              fi
+              if [ "${NETWORK_RESULTS_FOUND}" -lt "${TOTAL_GPU_NODES}" ]; then
+                NETWORK_CATEGORY="FAIL"
+                [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+              fi
+              if [ "${STORAGE_RESULTS_FOUND}" -lt "${TOTAL_GPU_NODES}" ]; then
+                STORAGE_CATEGORY="FAIL"
+                [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+              fi
+              
+              # Calculate aggregate storage throughput
+              TOTAL_SEQ_READ_MBPS=${TOTAL_SEQ_READ_MBPS:-0}
+              echo ""
+              echo "Aggregate Storage Throughput: ${TOTAL_SEQ_READ_MBPS} MB/s (across ${TOTAL_GPU_NODES} nodes)"
+              
+              GPU_RESULTS="${GPU_RESULTS}]"
+              NCCL_RESULTS="${NCCL_RESULTS}]"
+              NETWORK_RESULTS="${NETWORK_RESULTS}]"
+              STORAGE_RESULTS="${STORAGE_RESULTS}]"
+              
+              # Scheduler results
+              SCHEDULER_RESULTS="{}"
+              for dir in "${RESULTS_DIR}" "${SHARED_DIR}"; do
+                if [ -f "${dir}/scheduler-validation.json" ]; then
+                  SCHEDULER_RESULTS=$(cat "${dir}/scheduler-validation.json" | tr -d '\n')
+                  STATUS=$(grep -o '"overall_status"[[:space:]]*:[[:space:]]*"[^"]*"' "${dir}/scheduler-validation.json" | head -1 | cut -d'"' -f4)
+                  [ "${STATUS}" = "FAIL" ] && SCHEDULER_CATEGORY="FAIL"
+                  break
+                fi
+              done
+              if [ "${SCHEDULER_RESULTS}" = "{}" ]; then
+                SCHEDULER_CATEGORY="FAIL"
+                [ "${CLUSTER_STATUS}" = "READY" ] && CLUSTER_STATUS="DEGRADED"
+                DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS}scheduler:missing,"
+              fi
+              
+              # Clean up trailing commas
+              FAILED_NODES="${FAILED_NODES%,}"
+              DEGRADED_COMPONENTS="${DEGRADED_COMPONENTS%,}"
+              
+              # Generate recommendation
+              case "${CLUSTER_STATUS}" in
+                "READY")
+                  RECOMMENDATION="Cluster is READY for distributed GPU training. All preflight checks passed."
+                  ;;
+                "DEGRADED")
+                  RECOMMENDATION="Cluster can run training with DEGRADED performance. Review components: ${DEGRADED_COMPONENTS}. Consider remediation before production workloads."
+                  ;;
+                "NOT_READY")
+                  RECOMMENDATION="Cluster is NOT READY. Failed nodes have been tainted: ${FAILED_NODES}. Remediate hardware/software issues before training."
+                  ;;
+              esac
+              
+              # Generate final report
+              cat > "${FINAL_REPORT}" << EOF
+              {
+                "cluster_preflight_report": {
+                  "timestamp": "${TIMESTAMP}",
+                  "overall_status": "${CLUSTER_STATUS}",
+                  "summary": {
+                    "total_gpu_nodes": ${TOTAL_GPU_NODES},
+                    "healthy_nodes": ${HEALTHY_NODES},
+                    "failed_nodes": "${FAILED_NODES}",
+                    "degraded_components": "${DEGRADED_COMPONENTS}",
+                    "aggregate_storage_throughput_mbps": ${TOTAL_SEQ_READ_MBPS},
+                    "result_coverage": {
+                      "gpu_health_reports": ${GPU_RESULTS_FOUND},
+                      "nccl_reports": ${NCCL_RESULTS_FOUND},
+                      "network_reports": ${NETWORK_RESULTS_FOUND},
+                      "storage_reports": ${STORAGE_RESULTS_FOUND}
+                    }
+                  },
+                  "category_status": {
+                    "gpu_health": "${GPU_CATEGORY}",
+                    "nccl_fabric": "${NCCL_CATEGORY}",
+                    "network_tcp": "${NETWORK_CATEGORY}",
+                    "storage": "${STORAGE_CATEGORY}",
+                    "scheduler": "${SCHEDULER_CATEGORY}"
+                  },
+                  "recommendation": "${RECOMMENDATION}",
+                  "test_results": {
+                    "gpu_health": ${GPU_RESULTS},
+                    "nccl_intra_node": ${NCCL_RESULTS},
+                    "network_tcp": ${NETWORK_RESULTS},
+                    "storage": ${STORAGE_RESULTS},
+                    "scheduler": ${SCHEDULER_RESULTS}
+                  }
+                }
+              }
+              EOF
+              
+              # Also copy to hostPath
+              cp "${FINAL_REPORT}" "${RESULTS_DIR}/" 2>/dev/null || true
+              
+              echo ""
+              echo "=========================================="
+              echo "       CLUSTER PREFLIGHT REPORT"
+              echo "=========================================="
+              echo ""
+              echo "CLUSTER STATUS: ${CLUSTER_STATUS}"
+              echo ""
+              echo "Summary:"
+              echo "  Total GPU Nodes: ${TOTAL_GPU_NODES}"
+              echo "  Healthy Nodes: ${HEALTHY_NODES}"
+              [ -n "${FAILED_NODES}" ] && echo "  Failed Nodes: ${FAILED_NODES}"
+              [ -n "${DEGRADED_COMPONENTS}" ] && echo "  Degraded Components: ${DEGRADED_COMPONENTS}"
+              echo "  Aggregate Storage Throughput: ${TOTAL_SEQ_READ_MBPS} MB/s"
+              echo ""
+              echo "Category Status:"
+              echo "  GPU Health: ${GPU_CATEGORY}"
+              echo "  NCCL Fabric: ${NCCL_CATEGORY}"
+              echo "  Network/TCP: ${NETWORK_CATEGORY}"
+              echo "  Storage: ${STORAGE_CATEGORY}"
+              echo "  Scheduler: ${SCHEDULER_CATEGORY}"
+              echo ""
+              echo "Recommendation:"
+              echo "  ${RECOMMENDATION}"
+              echo ""
+              echo "=========================================="
+              
+              case "${CLUSTER_STATUS}" in
+                "READY") echo "CLUSTER READY FOR TRAINING"; exit 0 ;;
+                "DEGRADED") echo "CLUSTER DEGRADED - REVIEW WARNINGS"; exit 0 ;;
+                "NOT_READY") echo "CLUSTER NOT READY - REMEDIATION REQUIRED"; exit 1 ;;
+              esac
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory

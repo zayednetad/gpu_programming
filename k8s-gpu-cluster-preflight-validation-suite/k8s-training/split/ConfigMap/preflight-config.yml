@@ -1,0 +1,60 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: preflight-config
+  namespace: gpu-preflight
+data:
+  # =============================================================================
+  # NEBIUS B200 GPU CLUSTER - PREFLIGHT THRESHOLDS
+  # =============================================================================
+  # Based on:
+  #   - Nebius B200 cluster actual values (nvidia-smi output)
+  #   - Nebius documentation: https://docs.nebius.com/
+  #   - NVIDIA Blackwell architecture specifications
+  # =============================================================================
+  config.json: |
+    {
+      "cluster_info": {
+        "platform": "gpu-b200-sxm-a",
+        "region": "me-west1",
+        "gpu_model": "NVIDIA B200",
+        "infiniband_fabric": "me-west1-a"
+      },
+      "versions": {
+        "_comment": "Versions based on Nebius B200 cluster (nvidia-smi: Driver 570.195.03, CUDA 12.8)",
+        "nvidia_driver_min": "570.0",
+        "cuda_version_min": "12.8",
+        "nccl_version_min": "2.20"
+      },
+      "gpu": {
+        "_comment": "B200 SXM: 8 GPUs per node, 180GB HBM3e per GPU, TDP 1000W",
+        "expected_count_per_node": 8,
+        "max_temperature_celsius": 83,
+        "max_ecc_errors": 0,
+        "min_memory_gb": 175,
+        "max_utilization_idle": 5,
+        "min_matmul_tflops": 100
+      },
+      "nccl": {
+        "_comment": "B200 NVLink: 1.8TB/s bidirectional, NVSwitch 3.6TB/s per switch",
+        "min_intra_node_bandwidth_gbps": 450,
+        "max_latency_us": 30
+      },
+      "network": {
+        "_comment": "Nebius Quantum-2 InfiniBand: 400Gbps per port, 3.2Tbps per node",
+        "min_tcp_bandwidth_gbps": 20,
+        "max_tcp_latency_ms": 0.5,
+        "max_packet_loss_percent": 0.001
+      },
+      "storage": {
+        "_comment": "Nebius Filestore SSD: Shared filesystem for checkpoints",
+        "min_sequential_read_mbps": 500,
+        "min_sequential_write_mbps": 400,
+        "min_random_read_iops": 5000,
+        "max_latency_ms": 10
+      }
+    }
+# -----------------------------------------------------------------------------
+# RBAC - Service accounts and permissions
+# -----------------------------------------------------------------------------

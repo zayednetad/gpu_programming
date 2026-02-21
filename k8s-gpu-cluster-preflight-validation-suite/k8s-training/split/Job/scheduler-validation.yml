@@ -1,0 +1,51 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scheduler-validation
+  namespace: gpu-preflight
+  labels:
+    app: scheduler-test
+    component: scheduler
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: scheduler-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      containers:
+        - name: scheduler-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - "#!/bin/bash\nset -e\n\n# Install dependencies\napt-get update && apt-get install -y curl jq bc > /dev/null 2>&1\ncurl -LO \"https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl\" > /dev/null 2>&1\nchmod +x kubectl && mv kubectl /usr/local/bin/\n\nRESULTS_DIR=\"/results\"\nSHARED_DIR=\"/shared-results\"\nRESULT_FILE=\"${RESULTS_DIR}/scheduler-validation.json\"\nTIMESTAMP=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\n\nmkdir -p \"${RESULTS_DIR}\" \"${SHARED_DIR}\"\n\necho \"==========================================\"\necho \"Scheduler Validation\"\necho \"==========================================\"\n\nSTATUS=\"PASS\"\nISSUES=\"\"\n\n# --------------------------------------------------------\n# Test 1: Verify GPU pods land on GPU nodes only\n# --------------------------------------------------------\necho \"\"\necho \"Test 1: GPU pods on GPU nodes only...\"\n\nGPU_NODES=$(kubectl get nodes -l nebius.com/gpu=true -o jsonpath='{.items[*].metadata.name}')\nGPU_NODE_COUNT=$(echo $GPU_NODES | wc -w)\necho \"  GPU Nodes: ${GPU_NODE_COUNT} (${GPU_NODES})\"\n\n# Check our NCCL test pods landed on GPU nodes\nNCCL_PODS=$(kubectl get pods -n gpu-preflight -l app=nccl-test -o jsonpath='{range .items[*]}{.spec.nodeName}{\" \"}{end}' 2>/dev/null || echo \"\")\n\nfor pod_node in ${NCCL_PODS}; do\n  if ! echo \"${GPU_NODES}\" | grep -q \"${pod_node}\"; then\n    STATUS=\"FAIL\"\n    ISSUES=\"${ISSUES}gpu_pod_on_non_gpu_node(${pod_node});\"\n    echo \"  FAIL: GPU pod on non-GPU node ${pod_node}\"\n  fi\ndone\n\n[ -z \"${ISSUES}\" ] && echo \"  PASS: All GPU pods on GPU nodes\"\n\n# --------------------------------------------------------\n# Test 2: Verify tainted nodes are avoided\n# --------------------------------------------------------\necho \"\"\necho \"Test 2: Tainted nodes avoided...\"\n\nTAINTED_NODES=$(kubectl get nodes -o json | jq -r '.items[] | select(.spec.taints[]?.key == \"gpu-preflight\") | .metadata.name' 2>/dev/null || echo \"\")\n\nif [ -n \"${TAINTED_NODES}\" ]; then\n  echo \"  Tainted nodes: ${TAINTED_NODES}\"\n  \n  # Check no pods scheduled on tainted nodes (except our DaemonSet)\n  for node in ${TAINTED_NODES}; do\n    PODS_ON_TAINTED=$(kubectl get pods -n gpu-preflight --field-selector spec.nodeName=${node} -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | grep -v \"gpu-health-check\" || echo \"\")\n    if [ -n \"${PODS_ON_TAINTED}\" ]; then\n      echo \"  WARN: Pods on tainted node ${node}: ${PODS_ON_TAINTED}\"\n      ISSUES=\"${ISSUES}pods_on_tainted_node(${node});\"\n    fi\n  done\nelse\n  echo \"  No tainted nodes found\"\nfi\n\n# --------------------------------------------------------\n# Test 3: Multi-node job scheduling\n# --------------------------------------------------------\necho \"\"\necho \"Test 3: Multi-node job distribution...\"\n\n# Check if NCCL jobs are distributed across nodes\nUNIQUE_NODES=$(kubectl get pods -n gpu-preflight -l app=nccl-test -o jsonpath='{range .items[*]}{.spec.nodeName}{\"\\n\"}{end}' 2>/dev/null | sort -u | wc -l)\nTOTAL_NCCL_PODS=$(kubectl get pods -n gpu-preflight -l app=nccl-test --no-headers 2>/dev/null | wc -l)\n\necho \"  NCCL pods: ${TOTAL_NCCL_PODS} across ${UNIQUE_NODES} nodes\"\n\nif [ \"${UNIQUE_NODES}\" -lt 2 ] && [ \"${GPU_NODE_COUNT}\" -ge 2 ]; then\n  ISSUES=\"${ISSUES}poor_distribution(${UNIQUE_NODES}_nodes_used);\"\n  echo \"  WARN: Jobs not well distributed across nodes\"\nelse\n  echo \"  PASS: Jobs distributed across multiple nodes\"\nfi\n\n# --------------------------------------------------------\n# Test 4: Node label consistency\n# --------------------------------------------------------\necho \"\"\necho \"Test 4: Node label consistency...\"\n\nLABELED_NODES=$(kubectl get nodes -l preflight-status -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.labels.preflight-status}{\" \"}{end}' 2>/dev/null)\necho \"  Preflight labels: ${LABELED_NODES}\"\n\n# Generate report\ncat > \"${RESULT_FILE}\" << EOF\n{\n  \"test_type\": \"scheduler_validation\",\n  \"timestamp\": \"${TIMESTAMP}\",\n  \"overall_status\": \"${STATUS}\",\n  \"gpu_nodes\": {\n    \"count\": ${GPU_NODE_COUNT},\n    \"names\": \"${GPU_NODES}\"\n  },\n  \"tainted_nodes\": \"${TAINTED_NODES}\",\n  \"distribution\": {\n    \"unique_nodes_used\": ${UNIQUE_NODES},\n    \"total_pods\": ${TOTAL_NCCL_PODS}\n  },\n  \"issues\": \"${ISSUES}\"\n}\nEOF\n\n# Copy to shared storage\ncp \"${RESULT_FILE}\" \"${SHARED_DIR}/\" 2>/dev/null || true\n\necho \"\"\necho \"Scheduler validation complete. Status: ${STATUS}\"\n\n[ \"${STATUS}\" = \"FAIL\" ] && exit 1 || exit 0\n"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+# =============================================================================
+# SECTIONS 8, 9, 10: TELEMETRY AGGREGATOR
+# =============================================================================
+# ☑ JSON output per test
+# ☑ Metrics per node (GPU, NCCL, Storage, Network)
+# ☑ Pass/Fail per test category
+# ☑ Pass/Fail per node
+# ☑ Results to shared storage
+# ☑ Final decision: READY / DEGRADED / NOT_READY
+# ☑ Identify failing nodes/components
+# ☑ Recommend exclusion/remediation
+# =============================================================================

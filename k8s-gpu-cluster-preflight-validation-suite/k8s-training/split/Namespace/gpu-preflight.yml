@@ -1,0 +1,48 @@
+# =============================================================================
+# GPU CLUSTER PREFLIGHT VALIDATION SUITE - COMPLETE VERSION
+# =============================================================================
+# Covers ALL assignment requirements:
+#   1. Preflight Execution Framework
+#   2. Node & GPU Health Checks (Driver/CUDA/NCCL, Hardware, Compute, Isolation)
+#   3. Intra-Node GPU Fabric (NVLink/NVSwitch)
+#   4. Network / TCP Validation
+#   5. Storage Preflight (Shared Storage)
+#   6. Scheduler Validation
+#   7. Telemetry & Reporting
+#   8. Central Result Storage
+#   9. Final Decision Logic
+#
+# Based on Nebius official documentation:
+#   - NCCL Tests: https://docs.nebius.com/slurm-soperator/jobs/examples/nccl-all-reduce
+#   - GPU Platforms: https://docs.nebius.com/compute/virtual-machines/types
+#   - Storage: https://docs.nebius.com/compute/storage/types
+#   - Health Checks: https://nebius.com/blog/posts/how-we-build-reliable-clusters
+#   - NCCL Topology: https://github.com/nebius/nccl-topology
+#
+# Tuned to align with Nebius/NVIDIA guidance where applicable:
+#   ✅ NCCL_IB_QPS_PER_CONNECTION=2
+#   ✅ NCCL_NVLS_ENABLE=1 (NVLink SHARP)
+#   ✅ NCCL_BUFFSIZE=8388608 (8 MiB)
+#   ✅ DCGM diagnostics level 2
+#   ✅ Storage 4MiB blocks for max bandwidth
+#   ✅ NCCL path test with P2P/SHM disabled
+#
+# Usage:
+#   kubectl apply -f preflight-validation-suite.yaml
+#   kubectl logs job/preflight-aggregator -n gpu-preflight
+#   kubectl get nodes -L preflight-status
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NAMESPACE
+# -----------------------------------------------------------------------------
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-preflight
+  labels:
+    app: gpu-preflight
+# -----------------------------------------------------------------------------
+# CONFIGMAP - Test thresholds and pass/fail policy
+# -----------------------------------------------------------------------------

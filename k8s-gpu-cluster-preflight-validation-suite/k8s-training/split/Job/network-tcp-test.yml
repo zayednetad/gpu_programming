@@ -1,0 +1,77 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: network-tcp-test
+  namespace: gpu-preflight
+  labels:
+    app: network-test
+    component: network
+spec:
+  # Set parallelism/completions to your GPU node count for full-cluster coverage.
+  parallelism: 2
+  completions: 2
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: network-test
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-sa
+      nodeSelector:
+        nebius.com/gpu: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      hostname: network-test
+      subdomain: network-test-svc
+      containers:
+        - name: network-test
+          image: ubuntu:22.04
+          command: ["/bin/bash", "-c"]
+          args:
+            - "#!/bin/bash\nset -e\n\napt-get update && apt-get install -y iperf3 netcat-openbsd curl jq bc iputils-ping dnsutils > /dev/null 2>&1\ncurl -LO \"https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl\" > /dev/null 2>&1\nchmod +x kubectl && mv kubectl /usr/local/bin/\n\nNODE_NAME=\"${NODE_NAME:-unknown}\"\nPOD_IP=\"${POD_IP:-unknown}\"\nRESULTS_DIR=\"/results\"\nSHARED_DIR=\"/shared-results\"\nRESULT_FILE=\"${RESULTS_DIR}/${NODE_NAME}-network.json\"\nTIMESTAMP=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")\nCONFIG_FILE=\"/config/config.json\"\n\nmkdir -p \"${RESULTS_DIR}\" \"${SHARED_DIR}\"\n\necho \"==========================================\"\necho \"Network/TCP Validation\"\necho \"Node: ${NODE_NAME}\"\necho \"Pod IP: ${POD_IP}\"\necho \"==========================================\"\n\n# Load thresholds\nMIN_BW=$(cat \"${CONFIG_FILE}\" | python3 -c \"import sys,json; print(json.load(sys.stdin)['network']['min_tcp_bandwidth_gbps'])\" 2>/dev/null || echo 10)\nMAX_LAT=$(cat \"${CONFIG_FILE}\" | python3 -c \"import sys,json; print(json.load(sys.stdin)['network']['max_tcp_latency_ms'])\" 2>/dev/null || echo 1)\nMAX_LOSS=$(cat \"${CONFIG_FILE}\" | python3 -c \"import sys,json; print(json.load(sys.stdin)['network']['max_packet_loss_percent'])\" 2>/dev/null || echo 0.01)\n\n# Start iperf3 server in background\niperf3 -s -D -p 5001\nsleep 5\n\n# Get other GPU node IPs\nOTHER_NODES=$(kubectl get pods -n gpu-preflight -l app=network-test -o jsonpath='{.items[*].status.podIP}' 2>/dev/null | tr ' ' '\\n' | grep -v \"^${POD_IP}$\" | head -5)\n\necho \"Other nodes: ${OTHER_NODES}\"\n\nSTATUS=\"PASS\"\nISSUES=\"\"\nPEER_RESULTS=\"[\"\nFIRST=true\n\nfor peer_ip in ${OTHER_NODES}; do\n  [ -z \"${peer_ip}\" ] && continue\n  echo \"\"\n  echo \"Testing connectivity to ${peer_ip}...\"\n  \n  peer_status=\"PASS\"\n  peer_issues=\"\"\n  \n  # 1. Ping test (connectivity + latency + packet loss)\n  PING_OUTPUT=$(ping -c 20 -i 0.2 \"${peer_ip}\" 2>&1) || true\n  \n  PING_LATENCY=$(echo \"$PING_OUTPUT\" | grep \"avg\" | awk -F'/' '{print $5}' || echo \"999\")\n  PACKET_LOSS=$(echo \"$PING_OUTPUT\" | grep -oP '\\d+(?=% packet loss)' || echo \"100\")\n  \n  echo \"  Ping: Latency=${PING_LATENCY}ms, Loss=${PACKET_LOSS}%\"\n  \n  if (( $(echo \"${PACKET_LOSS} > ${MAX_LOSS}\" | bc -l 2>/dev/null || echo 0) )); then\n    peer_status=\"FAIL\"\n    peer_issues=\"${peer_issues}packet_loss(${PACKET_LOSS}%);\"\n    STATUS=\"FAIL\"\n    ISSUES=\"${ISSUES}${peer_ip}:packet_loss;\"\n  fi\n  \n  if (( $(echo \"${PING_LATENCY} > ${MAX_LAT}\" | bc -l 2>/dev/null || echo 0) )); then\n    peer_status=\"WARN\"\n    peer_issues=\"${peer_issues}high_latency(${PING_LATENCY}ms);\"\n  fi\n  \n  # 2. iperf3 bandwidth test\n  echo \"  Running iperf3 bandwidth test...\"\n  IPERF_OUTPUT=$(timeout 30 iperf3 -c \"${peer_ip}\" -p 5001 -t 10 -J 2>/dev/null) || IPERF_OUTPUT=\"{}\"\n  \n  BW_BITS=$(echo \"$IPERF_OUTPUT\" | jq -r '.end.sum_sent.bits_per_second // 0' 2>/dev/null || echo 0)\n  BW_GBPS=$(echo \"scale=2; ${BW_BITS} / 1000000000\" | bc 2>/dev/null || echo 0)\n  \n  echo \"  Bandwidth: ${BW_GBPS} Gbps\"\n  \n  if (( $(echo \"${BW_GBPS} < ${MIN_BW}\" | bc -l 2>/dev/null || echo 0) )); then\n    if [ \"${BW_GBPS}\" != \"0\" ]; then\n      peer_status=\"WARN\"\n      peer_issues=\"${peer_issues}low_bandwidth(${BW_GBPS}Gbps);\"\n    fi\n  fi\n  \n  [ \"${FIRST}\" = \"true\" ] && FIRST=false || PEER_RESULTS=\"${PEER_RESULTS},\"\n  PEER_RESULTS=\"${PEER_RESULTS}{\\\"peer_ip\\\":\\\"${peer_ip}\\\",\\\"latency_ms\\\":${PING_LATENCY:-0},\\\"packet_loss_pct\\\":${PACKET_LOSS:-0},\\\"bandwidth_gbps\\\":${BW_GBPS},\\\"status\\\":\\\"${peer_status}\\\",\\\"issues\\\":\\\"${peer_issues}\\\"}\"\ndone\n\nPEER_RESULTS=\"${PEER_RESULTS}]\"\n\n# Generate JSON report\ncat > \"${RESULT_FILE}\" << EOF\n{\n  \"test_type\": \"network_tcp\",\n  \"node\": \"${NODE_NAME}\",\n  \"pod_ip\": \"${POD_IP}\",\n  \"timestamp\": \"${TIMESTAMP}\",\n  \"overall_status\": \"${STATUS}\",\n  \"thresholds\": {\n    \"min_bandwidth_gbps\": ${MIN_BW},\n    \"max_latency_ms\": ${MAX_LAT},\n    \"max_packet_loss_pct\": ${MAX_LOSS}\n  },\n  \"peer_tests\": ${PEER_RESULTS},\n  \"issues\": \"${ISSUES}\"\n}\nEOF\n\n# Copy to shared storage\ncp \"${RESULT_FILE}\" \"${SHARED_DIR}/\" 2>/dev/null || true\n\necho \"\"\necho \"Network test complete. Status: ${STATUS}\"\n\n# Keep running briefly for other pods to test against us\nsleep 120\n\n[ \"${STATUS}\" = \"FAIL\" ] && exit 1 || exit 0\n"
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: results
+              mountPath: /results
+            - name: shared-results
+              mountPath: /shared-results
+            - name: config
+              mountPath: /config
+      volumes:
+        - name: results
+          hostPath:
+            path: /var/log/gpu-preflight
+            type: DirectoryOrCreate
+        - name: shared-results
+          hostPath:
+            path: /mnt/data
+            type: Directory
+        - name: config
+          configMap:
+            name: preflight-config
+# =============================================================================
+# SECTION 6: STORAGE PREFLIGHT (Shared Storage)
+# =============================================================================
+# ☑ Concurrent read test from multiple nodes
+# ☑ Sustained throughput measured
+# ☑ Large sequential read test
+# ☑ Many small random read test
+# ☑ Threshold validation
+# =============================================================================

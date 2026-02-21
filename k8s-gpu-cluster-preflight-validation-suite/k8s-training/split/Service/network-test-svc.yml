@@ -1,0 +1,13 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: network-test-svc
+  namespace: gpu-preflight
+spec:
+  clusterIP: None
+  selector:
+    app: network-test
+  ports:
+    - port: 5001
+      name: iperf

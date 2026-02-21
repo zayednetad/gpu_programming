@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-binding
+subjects:
+  - kind: ServiceAccount
+    name: preflight-sa
+    namespace: gpu-preflight
+roleRef:
+  kind: ClusterRole
+  name: preflight-role
+  apiGroup: rbac.authorization.k8s.io
+# -----------------------------------------------------------------------------
+# SHARED STORAGE - Host-mounted shared filesystem (Section 9)
+# -----------------------------------------------------------------------------
+# NOTE: This path must exist on every worker node and point to the same shared filesystem.
+# If your Nebius mount tag is different, replace `/mnt/data` in all `shared-results` volumes below.
+
+# =============================================================================
+# SECTION 3: NODE & GPU HEALTH CHECKS (Job)
+# =============================================================================
+# ☑ NVIDIA driver installed & version check
+# ☑ CUDA toolkit installed & version check  
+# ☑ NCCL installed & version check
+# ☑ Expected GPU count per node
+# ☑ ECC status & error count
+# ☑ GPU temperature threshold
+# ☑ GPU utilization check (not stuck)
+# ☑ Matrix multiply on EACH GPU with TFLOPS measurement
+# ☑ Node labeling/tainting for failed nodes
+# =============================================================================
