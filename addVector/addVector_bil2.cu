@@ -1,75 +1,103 @@
-// This program computer the sum of two N-element vectors using unified memory
+// This program computes the sum of two N-element vectors using unified memory
 // By: Nick from CoffeeBeforeArch
+// FIXED VERSION
 
 #include <stdio.h>
-//#include <cassert>
 #include <iostream>
+#include <cassert>
 
 using std::cout;
 
-// CUDA kernel for vector addition
-// No change when using CUDA unified memory
+// Error checking macro
+#define cudaCheck(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
+// CUDA kernel for vector addition - CORRECTED
 __global__ void vectorAdd(int *a, int *b, int *c, int N) {
-    // Calculate global thread thread ID
+    // Calculate global thread ID
+    // This is the CORRECT way - each thread processes ONE element
     int tid = (blockDim.x * blockIdx.x) + threadIdx.x;
 
-    // Each thread processes a portion of the array
-    int start = tid * (N / blockDim.x);
-    int end = start + (N / blockDim.x);
-
-    // Ensure that we don't go beyond the array size
-    end = min(end, N);
-
-    for (int i = start; i < end; ++i) {
-        c[i] = a[i] + b[i];
+    // Ensure thread doesn't go out of bounds
+    if (tid < N) {
+        c[tid] = a[tid] + b[tid];
     }
 }
 
 int main() {
-  // Array size of 2^16 (65536 elements)
-  //const int N = 1 << 16;
-  const int N = 1000000000; // Number of elements in the array
+  // Array size (reduced from 1 billion to 100 million to fit in memory)
+  const int N = 100000000; // 100 million elements
   size_t bytes = N * sizeof(int);
 
   // Declare unified memory pointers
   int *a, *b, *c;
 
-  // Allocation memory for these pointers
-  cudaMallocManaged(&a, bytes);
-  cudaMallocManaged(&b, bytes);
-  cudaMallocManaged(&c, bytes);
+  // Allocate memory for these pointers with error checking
+  cudaCheck(cudaMallocManaged(&a, bytes));
+  cudaCheck(cudaMallocManaged(&b, bytes));
+  cudaCheck(cudaMallocManaged(&c, bytes));
 
+  cout << "Initializing vectors...\n";
+  
   // Initialize vectors
   for (int i = 0; i < N; i++) {
     a[i] = rand() % 100;
     b[i] = rand() % 100;
   }
 
-  // Threads per CTA (1024 threads per CTA)
-  int BLOCK_SIZE = 1 << 10;
+  cout << "Running kernel...\n";
 
-  // CTAs per Grid
+  // Threads per block (1024 threads per block)
+  int BLOCK_SIZE = 1 << 10;  // 1024
+
+  // Blocks per grid
   int GRID_SIZE = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  printf("Grid: %d blocks, Block: %d threads\n", GRID_SIZE, BLOCK_SIZE);
 
   // Call CUDA kernel
   vectorAdd<<<GRID_SIZE, BLOCK_SIZE>>>(a, b, c, N);
 
+  // Check for kernel launch errors
+  cudaCheck(cudaGetLastError());
+
   // Wait for all previous operations before using values
-  // We need this because we don't get the implicit synchronization of
-  // cudaMemcpy like in the original example
-  cudaDeviceSynchronize();
+  cudaCheck(cudaDeviceSynchronize());
 
-  // Verify the result on the CPU
-  //for (int i = 0; i < N; i++) {
-  //  assert(c[i] == a[i] + b[i]);
-  //}
+  cout << "Verifying results...\n";
 
-  // Free unified memory (same as memory allocated with cudaMalloc)
-  cudaFree(a);
-  cudaFree(b);
-  cudaFree(c);
+  // Verify the result on the CPU (sample check)
+  bool correct = true;
+  int errors = 0;
+  for (int i = 0; i < N; i++) {
+    if (c[i] != a[i] + b[i]) {
+      if (errors < 10) {  // Print first 10 errors
+        printf("Error at index %d: c[%d]=%d, expected %d\n", i, i, c[i], a[i] + b[i]);
+      }
+      errors++;
+      correct = false;
+    }
+  }
 
-  cout << "COMPLETED SUCCESSFULLY!\n";
+  if (correct) {
+    cout << "VERIFICATION PASSED!\n";
+  } else {
+    printf("VERIFICATION FAILED! Found %d errors\n", errors);
+  }
+
+  // Free unified memory
+  cudaCheck(cudaFree(a));
+  cudaCheck(cudaFree(b));
+  cudaCheck(cudaFree(c));
+
+  cout << "COMPLETED!\n";
 
   return 0;
 }
